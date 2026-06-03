@@ -1,0 +1,29 @@
+{
+  "name": "wison-rbi-client",
+  "version": "1.6.0",
+  "description": "Wison-RBI: Browser Isolation Client (Chrome Extension MV3)",
+  "type": "module",
+  "scripts": {
+    "build": "echo 'No build step required — client runs directly in Chrome'",
+    "lint": "eslint *.js"
+  },
+  "dependencies": {
+    "canvaskit-wasm": "^0.39.1",
+    "socket.io-client": "^4.7.4"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": [
+    "browser-isolation",
+    "rbi",
+    "canvaskit",
+    "chrome-extension",
+    "mv3"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/laolv2023/wison-rbi"
+  }
+}

@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Wison-RBI</title>
+    <style>
+        *, *::before, *::after {
+            margin: 0;
+            padding: 0;
+            border: none;
+            box-sizing: border-box;
+        }
+
+        html, body {
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background: #fff;
+            /* 防止 text selection 干扰 HID 事件 */
+            -webkit-user-select: none;
+            user-select: none;
+            /* 防止 touch 事件触发浏览器行为 */
+            touch-action: none;
+        }
+
+        #main {
+            display: block;
+            position: fixed;
+            top: 0;
+            left: 0;
+            /* Canvas 尺寸由 JS 动态设置 */
+            image-rendering: auto;
+        }
+
+        /* 加载指示器 */
+        #loading {
+            position: fixed;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            font-size: 14px;
+            color: #666;
+            z-index: 100;
+            text-align: center;
+        }
+
+        #loading.hidden {
+            display: none;
+        }
+
+        /* 加载旋转动画 */
+        #loading .spinner {
+            width: 32px;
+            height: 32px;
+            margin: 0 auto 12px;
+            border: 3px solid #e0e0e0;
+            border-top-color: #1a73e8;
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+    </style>
+</head>
+<body>
+    <canvas id="main"></canvas>
+
+    <div id="loading">
+        <div class="spinner"></div>
+        <span id="loading-text">Loading Wison-RBI...</span>
+    </div>
+
+    <!-- Socket.IO 客户端 -->
+    <script src="./node_modules/socket.io-client/dist/socket.io.min.js"></script>
+    <!-- CanvasKit WASM -->
+    <script src="./node_modules/canvaskit-wasm/bin/canvaskit.js"></script>
+    <!-- 应用模块（ESM） -->
+    <script type="module" src="./index.js"></script>
+
+    <script>
+        // 加载完成后隐藏 loading 指示器
+        // （由 index.js 中的 init() 调用 hideLoading）
+        window.hideLoading = function() {
+            const el = document.getElementById('loading');
+            if (el) el.classList.add('hidden');
+        };
+    </script>
+</body>
+</html>

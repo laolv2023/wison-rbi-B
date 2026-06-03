@@ -1,0 +1,31 @@
+{
+  "name": "wison-rbi-server",
+  "version": "1.6.0",
+  "description": "Wison-RBI: Chromium Compositor-layer Browser Isolation Server",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --inspect server.js",
+    "test": "node --test tests/"
+  },
+  "dependencies": {
+    "chrome-remote-interface": "^0.33.1",
+    "uuid": "^9.0.1",
+    "ws": "^8.16.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": [
+    "browser-isolation",
+    "rbi",
+    "chromium",
+    "cdp",
+    "security"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/laolv2023/wison-rbi"
+  }
+}
