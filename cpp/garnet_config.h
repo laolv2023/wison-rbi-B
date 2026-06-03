@@ -173,6 +173,31 @@ constexpr uint8_t kOpcodeMax = 0x7F;
 // 非法 opcode（客户端必须拒收）
 constexpr uint8_t kOpcodeIllegalMin = 0x80;  // ≥ 0x80 一律非法
 
+// ═══════════════════════════════════════════════════════════════
+// 性能基准目标 (Phase 4 — §9.1)
+//
+// 所有目标值均为 Phase 3 的生产级别指标。Phase 1 目标见设计文档。
+// 基准测试运行: node server/benchmark.js
+// ═══════════════════════════════════════════════════════════════
+
+// 端到端延迟目标 (点击→画面更新, ms)
+constexpr double kTargetE2ELatencyMs = 80.0;       // Phase 3: <80ms
+
+// 帧生成延迟目标 (DrawLayers→DeliverFrame, ms)
+constexpr double kTargetFrameGenLatencyMs = 2.0;   // Phase 3: <2ms (Compositor 线程)
+
+// 首帧带宽目标 (gzip 压缩后, bytes)
+constexpr size_t kTargetFirstFrameBytes = 1 * 1024 * 1024;   // Phase 3: <1MB
+
+// 增量帧带宽目标 (gzip, bytes)
+constexpr size_t kTargetDeltaFrameBytes = 50 * 1024;          // Phase 3: <50KB
+
+// 客户端 CPU 目标 (60fps, M1 同级)
+constexpr double kTargetClientCpuPercent = 15.0;  // Phase 3: <15%
+
+// 客户端内存目标 (WASM, bytes)
+constexpr size_t kTargetClientMemoryBytes = 128 * 1024 * 1024;  // Phase 3: <128MB
+
 }  // namespace garnet
 
 #endif  // GARNET_GARNET_CONFIG_H_

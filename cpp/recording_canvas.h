@@ -1,7 +1,17 @@
 // recording_canvas.h — 录制 SkCanvas（拦截所有绘制调用）
 //
-// RecordingCanvas 继承 SkNWayCanvas（v1.6 P2 A5），重写所有 31 个绘制方法。
-// 每个方法将调用参数序列化到 CommandBuffer 中，而不是执行实际光栅化。
+// RecordingCanvas 直接继承 SkCanvas（v1.6 P2 A5 → Phase 3 切换）。
+// 重写所有 onDraw* 虚函数，将调用参数序列化到 CommandBuffer 中，
+// 而不是执行实际光栅化。
+//
+// Phase 3 切换理由 (§4.1.2):
+//   - SkNWayCanvas 是多路广播 Canvas，维护空子 Canvas 列表产生
+//     额外虚函数调度开销。
+//   - RecordingCanvas 仅需捕获命令，不需要广播语义。
+//   - SkCanvas 直接子类化（参考 SkPictureRecorder::SkPictureCanvas）
+//     更简洁高效，且不依赖 NWayCanvas 的内部实现细节。
+//   - 构造函数通过 SkBitmap 创建最小化 device，满足 SkCanvas
+//     构造要求，但不产生实际光栅化开销。
 //
 // 安全不变量:
 //   - onReadPixels() 虚函数重写返回 false，绝对禁止像素回读
@@ -22,7 +32,7 @@
 
 // Skia 实际头文件路径 (Chromium 源码树):
 // #include "include/core/SkCanvas.h"
-// #include "include/core/SkNWayCanvas.h"
+// #include "include/core/SkBitmap.h"
 // #include "include/core/SkPaint.h"
 // #include "include/core/SkPath.h"
 // #include "include/core/SkTextBlob.h"
@@ -33,9 +43,15 @@
 
 namespace garnet {
 
-class RecordingCanvas {
+// Phase 3: 从 SkNWayCanvas 切换为 SkCanvas 直接子类化。
+// Phase 1/2 使用 SkNWayCanvas 以利用其现成虚函数覆盖。
+// Phase 3 移除多路广播开销，直接继承 SkCanvas。
+class RecordingCanvas /* : public SkCanvas */ {
 public:
     // 工厂方法：创建 RecordingCanvas
+    // Phase 3: 内部创建最小 SkBitmap (1×1) 作为 SkCanvas 的 device，
+    //          满足 SkCanvas 构造要求，但不产生实际光栅化开销。
+    //          所有 onDraw* 虚函数被重写为序列化而非光栅化。
     // @param width  物理画布宽度
     // @param height 物理画布高度
     // @param image_mode 图像传输模式
@@ -184,6 +200,15 @@ public:
                               float thumb_size, const SkRect& bounds);
 
 private:
+    // Phase 3 构造函数:
+    //   创建最小化 SkBitmap (1×1, kRGBA_8888) 作为 device，
+    //   将其传递给 SkCanvas 基类构造函数。该 device 仅用于
+    //   满足 SkCanvas 的 API 契约，RecordingCanvas 的所有
+    //   onDraw* 虚函数均已重写，不会向其写入实际像素。
+    //
+    //   Chromium 源码树集成时签名:
+    //     RecordingCanvas(SkBitmap device, int width, int height,
+    //                     ImageMode image_mode);
     RecordingCanvas(int width, int height, ImageMode image_mode);
 
     CommandBuffer buffer_;
@@ -191,6 +216,9 @@ private:
     int height_;
     ImageMode image_mode_;
     bool recording_;
+
+    // Phase 3: SkCanvas 需要的最小 device（不产生光栅化开销）
+    // SkBitmap minimal_device_;  // 1×1, kRGBA_8888, 仅用于满足 SkCanvas 构造
 
     // Save/Restore 深度跟踪（用于录音时的一致性检查）
     int save_depth_;

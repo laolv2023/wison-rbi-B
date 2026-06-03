@@ -4,6 +4,15 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Wison-RBI</title>
+
+    <!-- Phase 4: CanvasKit WASM 预加载提示 -->
+    <link rel="preload" href="./node_modules/canvaskit-wasm/bin/canvaskit.js" as="script">
+    <link rel="preload" href="./node_modules/canvaskit-wasm/bin/canvaskit.wasm" as="fetch" crossorigin="anonymous">
+
+    <!-- Phase 4: DNS 预解析 + 预连接 (生产环境指向 Wison-RBI 服务器) -->
+    <link rel="dns-prefetch" href="//localhost">
+    <link rel="preconnect" href="//localhost" crossorigin>
+
     <style>
         *, *::before, *::after {
             margin: 0;

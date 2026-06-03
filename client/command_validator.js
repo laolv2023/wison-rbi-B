@@ -291,9 +291,112 @@ class CommandValidator {
                 break;
             }
 
+            // ── 含 Paint 的绘制命令: 校验 Paint 内的 Shader 子结构 (Phase 2) ──
+            case OP.DRAW_RECT:
+            case OP.DRAW_RRECT:
+            case OP.DRAW_OVAL:
+            case OP.DRAW_ARC:
+            case OP.DRAW_PATH:
+            case OP.DRAW_PAINT:
+            case OP.DRAW_SHADOW: {
+                // Paint 偏移因命令而异，但都从 payload 的某个固定偏移开始
+                // DRAW_RECT:  rect(16B) + paint → paint@16
+                // DRAW_RRECT: rrect(49B) + paint → paint@49  (12 float32 + 1B type)
+                // DRAW_OVAL:  rect(16B) + paint → paint@16
+                // DRAW_PATH:  path(variable) + paint@tail → 无法固定偏移
+                // DRAW_PAINT: paint@0
+                // DRAW_SHADOW: paint@0
+                // 简化: 对固定偏移的命令校验 paint，变长路径跳过
+                let paintOffset = -1;
+                if (opcode === OP.DRAW_PAINT || opcode === OP.DRAW_SHADOW) {
+                    paintOffset = 0;
+                } else if (opcode === OP.DRAW_RECT || opcode === OP.DRAW_OVAL) {
+                    paintOffset = 16;  // 16B rect
+                } else if (opcode === OP.DRAW_RRECT) {
+                    paintOffset = 49;  // 12×f32 + 1B type
+                } else if (opcode === OP.DRAW_ARC) {
+                    paintOffset = 20;  // rect(16B) + startAngle(4B) + sweepAngle(4B) → actually need to check
+                }
+                // DRAW_PATH: paint 在 path verbs 末尾，偏移不固定，跳过
+                if (paintOffset >= 0 && payLen >= paintOffset + 19) {
+                    const shaderResult = this._validatePaintShader(
+                        payload, paintOffset, payLen
+                    );
+                    if (!shaderResult.valid) return shaderResult;
+                }
+                break;
+            }
+
             default:
                 // 其他 opcode 当前不需要深度子结构校验
                 break;
+        }
+
+        return { valid: true };
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // Paint 内 Shader 子结构校验 (Phase 2)
+    //
+    // Paint 二进制格式 (§4.1.3):
+    //   [0:4]   color RGBA uint32 LE
+    //   [4:8]   stroke_width float32 LE
+    //   [8]     style
+    //   [9]     cap
+    //   [10]    join
+    //   [11]    _pad
+    //   [12:16] miter_limit float32 LE
+    //   [16]    blend_mode
+    //   [17]    anti_alias
+    //   [18]    has_shader
+    //   [19]    shader_type (if has_shader)
+    //   [20+]   shader_data (variable, if has_shader)
+    // ═══════════════════════════════════════════════════════════
+
+    _validatePaintShader(payload, paintOffset, payLen) {
+        const hasShader = payload.getUint8(paintOffset + 18);
+
+        if (!hasShader) return { valid: true };
+
+        // 需要至少 18B paint header + 1B has_shader + 1B shader_type
+        if (paintOffset + 20 > payLen) {
+            return this._subReject('Paint: payload too short for shader header');
+        }
+
+        const shaderOffset = paintOffset + 19;
+        const shaderType = payload.getUint8(shaderOffset);
+
+        const HEADER = PROTOCOL.SHADER_HEADER_SIZE;
+        if (!(shaderType in HEADER)) {
+            return this._subReject(`Paint: unknown shader type 0x${shaderType.toString(16)}`);
+        }
+
+        const headerSize = HEADER[shaderType];
+
+        // 检查 shader 头部不会越界
+        if (shaderOffset + headerSize > payLen) {
+            return this._subReject(
+                `Paint: shader header overflow (type=${shaderType}, need ≥${shaderOffset + headerSize}, have ${payLen})`
+            );
+        }
+
+        // 读取 colorCount (总是在 shader header 末尾前第 3 个字节)
+        const colorCount = payload.getUint8(shaderOffset + headerSize - 3);
+        const MAX = PROTOCOL.MAX_GRADIENT_COLORS;
+
+        if (colorCount > MAX) {
+            return this._subReject(
+                `Paint: shader colorCount ${colorCount} > MAX_GRADIENT_COLORS (${MAX})`
+            );
+        }
+
+        // 验证颜色表大小
+        const colorTableSize = colorCount * 8;  // 每对 RGBA(4) + position(4)
+        const totalShaderSize = headerSize + colorTableSize;
+        if (shaderOffset + totalShaderSize > payLen) {
+            return this._subReject(
+                `Paint: shader color table overflow (need ${totalShaderSize}, have ${payLen - shaderOffset})`
+            );
         }
 
         return { valid: true };

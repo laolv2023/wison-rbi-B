@@ -16,6 +16,8 @@
 'use strict';
 
 const http = require('http');
+const https = require('https');
+const fs = require('fs');
 const { Server: WsServer } = require('ws');
 const { v4: uuidv4 } = require('uuid');
 const { ChromiumPool } = require('./chromium_manager');
@@ -23,7 +25,27 @@ const Session = require('./session');
 const InputProxy = require('./io_proxy');
 const { assembleFrame, compressFrame } = require('./frame_builder');
 const { isSafeFontData } = require('./font_validator');
-const { WS_HIGH_WATER_MARK, PROTOCOL_VERSION } = require('./config');
+const {
+    metrics,
+    SESSIONS_ACTIVE,
+    SESSIONS_TOTAL,
+    FRAMES_SENT,
+    FRAMES_DROPPED,
+    WS_CONNECTIONS,
+    WS_BACKPRESSURE,
+    WS_ERRORS,
+    checkAlerts,
+} = require('./metrics');
+const {
+    WS_HIGH_WATER_MARK,
+    PROTOCOL_VERSION,
+    TLS_DEFAULT_CERT_PATH,
+    TLS_DEFAULT_KEY_PATH,
+    TLS_DEFAULT_CA_PATH,
+    TLS_CIPHER_SUITE,
+    TLS_MIN_VERSION,
+    TLS_HONOR_CIPHER_ORDER,
+} = require('./config');
 
 // ═══════════════════════════════════════════════════════════════
 // WisonRBI Server
@@ -35,27 +57,46 @@ class WisonRBIServer {
      * @param {number} [options.port=3000] - HTTP/WebSocket 端口
      * @param {string} [options.chromiumPath] - Chromium 可执行路径
      * @param {number} [options.maxSessions=4] - 最大并发会话数
+     * @param {string} [options.tlsCert] - TLS 证书路径 (PEM)
+     * @param {string} [options.tlsKey]  - TLS 私钥路径 (PEM)
+     * @param {string} [options.tlsCa]   - CA 证书路径 (mTLS, 可选)
      */
     constructor(options = {}) {
         this._port = options.port || 3000;
         this._chromiumPath = options.chromiumPath || 'chromium';
         this._maxSessions = options.maxSessions || 4;
 
-        // ── HTTP Server (WebSocket 需要升级) ──
-        this._httpServer = http.createServer((req, res) => {
-            // 健康检查端点
-            if (req.url === '/health') {
-                res.writeHead(200, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({
-                    status: 'ok',
-                    sessions: this._sessions.size,
-                    uptime: process.uptime(),
-                }));
-                return;
+        // ── TLS 配置 (Phase 3 安全加固) ──
+        const tlsCert = options.tlsCert || TLS_DEFAULT_CERT_PATH;
+        const tlsKey  = options.tlsKey  || TLS_DEFAULT_KEY_PATH;
+        const tlsCa   = options.tlsCa   || TLS_DEFAULT_CA_PATH;
+        this._tlsEnabled = !!(tlsCert && tlsKey);
+
+        let server;
+        if (this._tlsEnabled) {
+            const tlsOptions = {
+                cert: fs.readFileSync(tlsCert),
+                key:  fs.readFileSync(tlsKey),
+                ciphers: TLS_CIPHER_SUITE,
+                minVersion: TLS_MIN_VERSION,
+                honorCipherOrder: TLS_HONOR_CIPHER_ORDER,
+            };
+            if (tlsCa) {
+                tlsOptions.ca = fs.readFileSync(tlsCa);
+                tlsOptions.requestCert = true;
+                tlsOptions.rejectUnauthorized = true;
             }
-            res.writeHead(404);
-            res.end();
-        });
+            server = https.createServer(tlsOptions, (req, res) => {
+                this._handleHttpRequest(req, res);
+            });
+        } else {
+            server = http.createServer((req, res) => {
+                this._handleHttpRequest(req, res);
+            });
+        }
+
+        // ── HTTP(s) Server ──
+        this._httpServer = server;
 
         // ── WebSocket Server ──
         this._wsServer = new WsServer({
@@ -84,13 +125,50 @@ class WisonRBIServer {
     }
 
     // ═══════════════════════════════════════════════════════════
+    // HTTP 请求处理
+    // ═══════════════════════════════════════════════════════════
+
+    _handleHttpRequest(req, res) {
+        // 指标端点 (Prometheus 兼容)
+        if (req.url === '/metrics') {
+            const snap = metrics.snapshot();
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify(snap, null, 2));
+            return;
+        }
+
+        // 健康检查端点
+        if (req.url === '/health') {
+            const snap = metrics.snapshot();
+            const alerts = checkAlerts();
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({
+                status: alerts.length > 0 ? 'degraded' : 'ok',
+                sessions: this._sessions.size,
+                uptime: process.uptime(),
+                tls: this._tlsEnabled,
+                metrics: {
+                    frames_sent: snap.counters[FRAMES_SENT] || 0,
+                    frames_dropped: snap.counters[FRAMES_DROPPED] || 0,
+                    ws_connections: snap.counters[WS_CONNECTIONS] || 0,
+                },
+                alerts: alerts.length > 0 ? alerts : undefined,
+            }));
+            return;
+        }
+        res.writeHead(404);
+        res.end();
+    }
+
+    // ═══════════════════════════════════════════════════════════
     // 启动/关闭
     // ═══════════════════════════════════════════════════════════
 
     async start() {
         return new Promise((resolve) => {
             this._httpServer.listen(this._port, () => {
-                console.log(`[server] Wison-RBI server listening on port ${this._port}`);
+                const proto = this._tlsEnabled ? 'https/wss' : 'http/ws';
+                console.log(`[server] Wison-RBI server listening on ${proto}://0.0.0.0:${this._port}`);
                 resolve();
             });
         });
@@ -123,6 +201,11 @@ class WisonRBIServer {
     async _onConnection(ws, req) {
         const sessionId = uuidv4();
         console.log(`[server] New connection: ${sessionId} (from ${req.socket.remoteAddress})`);
+
+        // Phase 5: 指标记录
+        metrics.setGauge(SESSIONS_ACTIVE, this._sessions.size + 1);
+        metrics.counter(SESSIONS_TOTAL);
+        metrics.counter(WS_CONNECTIONS);
 
         // 创建会话
         const session = new Session(sessionId);
@@ -175,6 +258,7 @@ class WisonRBIServer {
             clearInterval(backpressureInterval);
             session.close();
             this._sessions.delete(sessionId);
+            metrics.decGauge(SESSIONS_ACTIVE);
             this._chromiumPool.release(sessionId).catch(err => {
                 console.error(`[server] Error releasing chromium:`, err.message);
             });
@@ -183,12 +267,14 @@ class WisonRBIServer {
         // ── 错误处理 ──
         ws.on('error', (err) => {
             console.error(`[server] WebSocket error for ${sessionId}:`, err.message);
+            metrics.counter(WS_ERRORS);
         });
 
         // ── 背压监控 ──
         const backpressureInterval = setInterval(() => {
             if (session.closed) return;
             if (ws.bufferedAmount > WS_HIGH_WATER_MARK) {
+                metrics.counter(WS_BACKPRESSURE);
                 console.warn(
                     `[server] Backpressure for ${sessionId}: ` +
                     `${ws.bufferedAmount} bytes buffered`
@@ -287,6 +373,7 @@ class WisonRBIServer {
         if (ws.bufferedAmount > WS_HIGH_WATER_MARK) {
             if (!frameMeta.isKeyframe) {
                 // 丢弃非关键帧
+                metrics.counter(FRAMES_DROPPED);
                 console.warn(
                     `[server] Dropping non-keyframe ${frameMeta.frameId} ` +
                     `due to backpressure (${ws.bufferedAmount} bytes buffered)`
@@ -304,6 +391,7 @@ class WisonRBIServer {
 
             // 发送二进制帧
             ws.send(compressed, { binary: true });
+            metrics.counter(FRAMES_SENT);
 
             // 记录帧元数据到会话历史
             session.recordFrame({

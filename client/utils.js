@@ -276,12 +276,22 @@ export { LOG_LEVELS };
 // ═══════════════════════════════════════════════════════════════
 
 /**
- * 在渲染循环中注入 ±1ms 的随机抖动。
+ * 生成 [-1.0, +1.0] ms 的均匀分布随机抖动值。
  * 安全理由: 破坏攻击者通过精确渲染时序推断页面内容的侧信道。
  *
- * @returns {Promise<void>} 随机延迟后 resolve
+ * @returns {number} 抖动值，单位 ms
  */
 export function randomJitter() {
-    const jitterMs = (Math.random() * 2 - 1);  // [-1, +1] ms
-    return new Promise(resolve => setTimeout(resolve, Math.abs(jitterMs)));
+    return (Math.random() * 2.0 - 1.0);  // 均匀分布 [-1.0, +1.0] ms
+}
+
+/**
+ * 异步版本: 在渲染循环中注入 ±1ms 随机延迟。
+ * 使用 setTimeout 实现非阻塞抖动，不卡主线程。
+ *
+ * @returns {Promise<void>}
+ */
+export function randomJitterAsync() {
+    const jitterMs = Math.abs(randomJitter());  // [0, 1] ms 延迟
+    return new Promise(resolve => setTimeout(resolve, jitterMs));
 }

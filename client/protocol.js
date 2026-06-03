@@ -124,6 +124,34 @@ const PROTOCOL = Object.freeze({
         COLLECTION:  0x74746366,
         WOFF2:       0x774F4632,
     }),
+
+    // ── Shader 类型 (Phase 2) ──
+    SHADER_TYPE: Object.freeze({
+        NONE:              0x00,
+        LINEAR_GRADIENT:   0x01,
+        RADIAL_GRADIENT:   0x02,
+        SWEEP_GRADIENT:    0x03,
+        CONICAL_GRADIENT:  0x04,
+    }),
+
+    // ── TileMode (Skia SkTileMode) ──
+    TILE_MODE: Object.freeze({
+        CLAMP:  0,
+        REPEAT: 1,
+        MIRROR: 2,
+        DECAL:  3,
+    }),
+
+    // ── Shader 头部大小 (不含颜色表) ──
+    SHADER_HEADER_SIZE: {
+        0x01: 20,  // LinearGradient: 4 floats + tileMode + colorCount + 2B pad
+        0x02: 20,  // RadialGradient: 4 floats + tileMode + colorCount + 2B pad
+        0x03: 20,  // SweepGradient:  4 floats + tileMode + colorCount + 2B pad
+        0x04: 28,  // Conical:       6 floats + tileMode + colorCount + 2B pad
+    },
+
+    // ── 渐变颜色停止点最大数量 ──
+    MAX_GRADIENT_COLORS: 32,
 });
 
 export { PROTOCOL };

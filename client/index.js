@@ -17,7 +17,7 @@
 // 性能:
 //   - handleFrame 使用 requestAnimationFrame 调度
 //   - 最新帧策略：处理中的帧被新到达的帧替代
-//   - ±1ms 渲染抖动 (Phase 2 侧信道防御)
+//   - ±1ms 渲染抖动已启用 (Phase 2 侧信道防御)
 //
 
 'use strict';
@@ -34,6 +34,7 @@ import {
     auditLog,
     LOG_LEVELS,
     randomJitter,
+    randomJitterAsync,
 } from './utils.js';
 
 (() => {
@@ -50,7 +51,7 @@ import {
         MAX_RECONNECT_DELAY_MS: 30000,
         FRAME_HISTORY_MAX_AGE_MS: PROTOCOL.LIMITS.FRAME_HISTORY_MAX_AGE_MS,
         VIEWPORT_RESIZE_DEBOUNCE_MS: 150,
-        JITTER_ENABLED: false,  // Phase 2: 设为 true 启用 ±1ms 抖动
+        JITTER_ENABLED: true,   // Phase 2: ±1ms 侧信道防御抖动
     });
 
     // ═══════════════════════════════════════════════════════════
@@ -341,7 +342,7 @@ import {
             if (!renderScheduled) {
                 renderScheduled = true;
                 // 使用微任务队列，在下一帧渲染前处理
-                renderFrame(commandStream, header.isKeyframe);
+                await renderFrame(commandStream, header.isKeyframe);
             }
 
             auditLog(LOG_LEVELS.DEBUG, 'frame_received', {
@@ -368,7 +369,7 @@ import {
     // 命令重放引擎
     // ═══════════════════════════════════════════════════════════
 
-    function renderFrame(commandStream, isKeyframe) {
+    async function renderFrame(commandStream, isKeyframe) {
         // 检查是否有更新的帧到达
         // （简化版：直接渲染。完整版需要 pending 帧 ID 比较。）
 
@@ -404,6 +405,11 @@ import {
                 // 4 字节对齐
                 const remainder = offset % 4;
                 if (remainder !== 0) offset += (4 - remainder);
+            }
+
+            // Phase 2 侧信道防御: flush 前注入 ±1ms 随机抖动
+            if (CONFIG.JITTER_ENABLED) {
+                await randomJitterAsync();
             }
 
             // Flush 到 GPU
@@ -520,8 +526,12 @@ import {
                 break;
             case OP.DRAW_PATH:
                 {
+                    const verbCount = payload.getUint32(0, true);
+                    const pointCount = payload.getUint32(4, true);
                     const path = readPath(payload, 0);
-                    const paint = readPaint(payload, payLen);
+                    // Paint 位于 path 动词 + 点数据之后
+                    const paintOffset = 8 + verbCount + pointCount * 8;
+                    const paint = readPaint(payload, paintOffset);
                     skCanvas.drawPath(path, paint);
                     path.delete();
                     paint.delete();
@@ -583,17 +593,188 @@ import {
     // ═══════════════════════════════════════════════════════════
 
     function readPaint(payload, offset) {
-        // 简化版 SkPaint 反序列化
-        // 完整实现需包含: color, blendMode, style, strokeWidth, shader, maskFilter, ...
-        const r = payload.getUint8(offset) / 255;
-        const g = payload.getUint8(offset + 1) / 255;
-        const b = payload.getUint8(offset + 2) / 255;
-        const a = payload.getUint8(offset + 3) / 255;
-
+        // ── Paint 二进制格式 (§4.1.3) ──
+        //   [0:4]   color RGBA uint32 LE
+        //   [4:8]   stroke_width float32 LE
+        //   [8]     style (0=Fill, 1=Stroke, 2=StrokeAndFill)
+        //   [9]     cap
+        //   [10]    join
+        //   [11]    _pad (对齐)
+        //   [12:16] miter_limit float32 LE
+        //   [16]    blend_mode
+        //   [17]    anti_alias
+        //   [18]    has_shader
+        //   [19+]   shader variant (if has_shader)
+        //   [...]    has_mask_filter + mask_filter variant
+        //   [...]    has_color_filter + color_filter variant
+        //   [...]    has_image_filter + image_filter variant
         const paint = new canvasKit.Paint();
-        paint.setColor([r, g, b, a]);
-        paint.setAntiAlias(true);
+
+        // Color: 解包 uint32 RGBA
+        const rgba = payload.getUint32(offset, true);
+        paint.setColor([
+            ((rgba >> 0)  & 0xFF) / 255,
+            ((rgba >> 8)  & 0xFF) / 255,
+            ((rgba >> 16) & 0xFF) / 255,
+            ((rgba >> 24) & 0xFF) / 255,
+        ]);
+
+        // Stroke
+        paint.setStrokeWidth(payload.getFloat32(offset + 4, true));
+
+        // Style
+        const styleVal = payload.getUint8(offset + 8);
+        paint.setStyle(
+            styleVal === 1 ? canvasKit.PaintStyle.Stroke :
+            styleVal === 2 ? canvasKit.PaintStyle.StrokeAndFill :
+            canvasKit.PaintStyle.Fill
+        );
+
+        // Stroke properties
+        paint.setStrokeCap(payload.getUint8(offset + 9));
+        paint.setStrokeJoin(payload.getUint8(offset + 10));
+        // offset+11 = _pad (skip)
+        paint.setStrokeMiter(payload.getFloat32(offset + 12, true));
+
+        // BlendMode (SkBlendMode enum values match CanvasKit)
+        const blendVal = payload.getUint8(offset + 16);
+        if (blendVal > 0 && blendVal <= 29) {
+            paint.setBlendMode(blendVal);
+        }
+        // (CanvasKit default is SrcOver = 3)
+
+        // AntiAlias
+        paint.setAntiAlias(payload.getUint8(offset + 17) !== 0);
+
+        let bytesRead = 18;
+
+        // ── Shader (Phase 2: 变长渐变解析) ──
+        const hasShader = payload.getUint8(offset + bytesRead);
+        bytesRead += 1;
+        if (hasShader) {
+            const shaderResult = readShader(payload, offset + bytesRead);
+            if (shaderResult.shader) {
+                paint.setShader(shaderResult.shader);
+            }
+            bytesRead += shaderResult.bytesRead;
+        }
+
+        // ── MaskFilter (Phase 3: placeholder skip) ──
+        const hasMask = payload.getUint8(offset + bytesRead);
+        bytesRead += 1;
+        if (hasMask) bytesRead += 8;  // BlurMaskFilter: style(4) + sigma(4)
+
+        // ── ColorFilter (Phase 3: placeholder skip) ──
+        const hasColorFilter = payload.getUint8(offset + bytesRead);
+        bytesRead += 1;
+        if (hasColorFilter) bytesRead += 16;  // matrix[20] placeholder
+
+        // ── ImageFilter (Phase 3: placeholder skip) ──
+        const hasImageFilter = payload.getUint8(offset + bytesRead);
+        bytesRead += 1;
+        if (hasImageFilter) bytesRead += 16;  // placeholder
+
         return paint;
+    }
+
+    /**
+     * 反序列化 Shader variant (Phase 2)。
+     *
+     * Shader 二进制格式:
+     *   [1B] shader_type
+     *   [header] 渐变参数 (类型相关)
+     *   [1B] tile_mode
+     *   [1B] color_count
+     *   [2B] _pad (reserved)
+     *   [color_count × 8B] color_stops (RGBA u32 + position f32)
+     *
+     * @returns {{ shader: SkShader|null, bytesRead: number }}
+     */
+    function readShader(payload, offset) {
+        const ST = PROTOCOL.SHADER_TYPE;
+        const shaderType = payload.getUint8(offset);
+
+        if (shaderType === ST.NONE) {
+            return { shader: null, bytesRead: 1 };
+        }
+
+        const HEADER_SIZES = PROTOCOL.SHADER_HEADER_SIZE;
+        const headerSize = HEADER_SIZES[shaderType];
+        if (!headerSize) {
+            auditLog(LOG_LEVELS.WARN, 'unknown_shader_type', { shaderType });
+            return { shader: null, bytesRead: 1 };
+        }
+
+        // 读取 tileMode 和 colorCount (在 header 末尾前)
+        const tileMode = payload.getUint8(offset + headerSize - 3);
+        const colorCount = payload.getUint8(offset + headerSize - 2);
+
+        // 读取颜色停止点
+        const colors = [];
+        const positions = [];
+        let pos = offset + headerSize;
+        for (let i = 0; i < colorCount; i++) {
+            const crgba = payload.getUint32(pos, true);
+            const r = ((crgba >> 0)  & 0xFF) / 255;
+            const g = ((crgba >> 8)  & 0xFF) / 255;
+            const b = ((crgba >> 16) & 0xFF) / 255;
+            const a = ((crgba >> 24) & 0xFF) / 255;
+            colors.push(r, g, b, a);
+            positions.push(payload.getFloat32(pos + 4, true));
+            pos += 8;
+        }
+
+        let shader;
+        switch (shaderType) {
+            case ST.LINEAR_GRADIENT: {
+                const sx = payload.getFloat32(offset + 1, true);
+                const sy = payload.getFloat32(offset + 5, true);
+                const ex = payload.getFloat32(offset + 9, true);
+                const ey = payload.getFloat32(offset + 13, true);
+                shader = canvasKit.Shader.MakeLinearGradient(
+                    [sx, sy], [ex, ey], colors, positions, tileMode
+                );
+                break;
+            }
+            case ST.RADIAL_GRADIENT: {
+                const cx = payload.getFloat32(offset + 1, true);
+                const cy = payload.getFloat32(offset + 5, true);
+                const r = payload.getFloat32(offset + 9, true);
+                shader = canvasKit.Shader.MakeRadialGradient(
+                    [cx, cy], r, colors, positions, tileMode
+                );
+                break;
+            }
+            case ST.SWEEP_GRADIENT: {
+                const cx = payload.getFloat32(offset + 1, true);
+                const cy = payload.getFloat32(offset + 5, true);
+                const sa = payload.getFloat32(offset + 9, true);
+                const ea = payload.getFloat32(offset + 13, true);
+                shader = canvasKit.Shader.MakeSweepGradient(
+                    cx, cy, colors, positions, tileMode,
+                    sa, ea
+                );
+                break;
+            }
+            case ST.CONICAL_GRADIENT: {
+                const sx = payload.getFloat32(offset + 1, true);
+                const sy = payload.getFloat32(offset + 5, true);
+                const sr = payload.getFloat32(offset + 9, true);
+                const ex = payload.getFloat32(offset + 13, true);
+                const ey = payload.getFloat32(offset + 17, true);
+                const er = payload.getFloat32(offset + 21, true);
+                shader = canvasKit.Shader.MakeTwoPointConicalGradient(
+                    [sx, sy], sr, [ex, ey], er, colors, positions, tileMode
+                );
+                break;
+            }
+            default:
+                auditLog(LOG_LEVELS.WARN, 'unhandled_shader_type', { shaderType });
+                break;
+        }
+
+        const totalBytes = headerSize + colorCount * 8;
+        return { shader: shader || null, bytesRead: totalBytes };
     }
 
     function readRect(payload, offset) {
@@ -755,8 +936,14 @@ import {
 
     function renderLoop(timestamp) {
         // Phase 2 侧信道防御: ±1ms 随机抖动
+        // 原理: 在每个渲染帧之间插入随机延迟，使攻击者无法
+        //       通过精确测量帧间隔推断页面渲染内容和用户行为。
         if (CONFIG.JITTER_ENABLED) {
-            randomJitter().then(() => requestAnimationFrame(renderLoop));
+            // 基线约 16.67ms (60fps) + [-1, +1] ms 抖动
+            const jitterMs = randomJitter();
+            // 使用 setTimeout 实现非阻塞延迟，然后将控制权交还 rAF
+            const delayMs = Math.max(0, jitterMs + 1.0);  // [0, 2] ms
+            setTimeout(() => requestAnimationFrame(renderLoop), delayMs);
             return;
         }
 
@@ -845,35 +1032,86 @@ import {
     }
 
     // ═══════════════════════════════════════════════════════════
-    // 敏感快捷键过滤
+    // 敏感快捷键过滤 (Phase 3 增强: 平台感知)
     // ═══════════════════════════════════════════════════════════
 
+    /**
+     * 检测是否为浏览器/操作系统敏感快捷键，拦截后不发往服务端。
+     *
+     * Phase 3 增强:
+     *   - macOS (Cmd) vs 其他平台 (Ctrl) 区分
+     *   - 补充遗漏快捷键 (Ctrl+P/U/L/0/+/- Esc 等)
+     *   - 使用 code 辅助识别，避免键盘布局差异
+     */
     function isBrowserShortcut(e) {
-        const ctrlOrMeta = e.ctrlKey || e.metaKey;
+        const isMac = /Mac|iPhone|iPad|iPod/.test(navigator.platform);
+        const mod = isMac ? e.metaKey : e.ctrlKey;  // macOS=Cmd, 其他=Ctrl
+        const modOrCtrl = e.ctrlKey || e.metaKey;   // 任意平台修饰键
+        const { key, code, altKey, shiftKey, metaKey, ctrlKey } = e;
 
-        // 标签页操作
-        if (ctrlOrMeta && ['t', 'T', 'n', 'N', 'w', 'W', 'q', 'Q'].includes(e.key)) return true;
-        if (ctrlOrMeta && e.shiftKey && ['T', 'N'].includes(e.key)) return true;
-        if (ctrlOrMeta && e.key === 'Tab') return true;
-        if (ctrlOrMeta && e.shiftKey && e.key === 'Tab') return true;
-        if (ctrlOrMeta && /^[1-9]$/.test(e.key)) return true;
-        if (['PageUp', 'PageDown'].includes(e.key) && ctrlOrMeta) return true;
+        // ── 全局浏览器控制 ──
+        // 新建标签页
+        if (modOrCtrl && ['t', 'T'].includes(key)) return true;
+        if (modOrCtrl && shiftKey && ['T'].includes(key)) return true;
+        // 关闭标签页
+        if (modOrCtrl && ['w', 'W'].includes(key)) return true;
+        // 退出浏览器
+        if (modOrCtrl && ['q', 'Q'].includes(key)) return true;
+        if (altKey && key === 'F4') return true;
+        // 新建窗口
+        if (modOrCtrl && ['n', 'N'].includes(key)) return true;
+        if (modOrCtrl && shiftKey && ['N'].includes(key)) return true;
+        // 切换标签页
+        if (modOrCtrl && /^[1-9]$/.test(key)) return true;
+        if (modOrCtrl && key === 'Tab') return true;
+        if (modOrCtrl && shiftKey && key === 'Tab') return true;
+        if (modOrCtrl && ['PageUp', 'PageDown'].includes(key)) return true;
 
-        // 窗口操作
-        if (e.altKey && e.key === 'F4') return true;
-        if (e.key === 'F11') return true;
+        // ── 导航 ──
+        if (altKey && ['ArrowLeft', 'ArrowRight'].includes(key)) return true;
+        if (modOrCtrl && ['[', ']'].includes(key)) return true;
 
-        // 页面操作
-        if (ctrlOrMeta && ['r', 'R'].includes(e.key)) return true;
-        if (e.key === 'F5') return true;
-        if (ctrlOrMeta && ['s', 'S'].includes(e.key)) return true;
-        if (ctrlOrMeta && ['d', 'D'].includes(e.key)) return true;
-        if (ctrlOrMeta && ['h', 'H'].includes(e.key)) return true;
-        if (ctrlOrMeta && ['j', 'J'].includes(e.key)) return true;
+        // ── 页面操作 ──
+        if (modOrCtrl && ['r', 'R'].includes(key)) return true;   // 刷新
+        if (key === 'F5') return true;
+        if (modOrCtrl && shiftKey && ['r', 'R'].includes(key)) return true; // 强制刷新
+        if (modOrCtrl && ['s', 'S'].includes(key)) return true;   // 保存
+        if (modOrCtrl && ['p', 'P'].includes(key)) return true;   // 打印
+        if (modOrCtrl && shiftKey && ['p', 'P'].includes(key)) return true; // 系统打印
+        if (modOrCtrl && ['u', 'U'].includes(key)) return true;   // 查看源码
+        if (modOrCtrl && ['d', 'D'].includes(key)) return true;   // 添加书签
+        if (modOrCtrl && ['l', 'L'].includes(key)) return true;   // 聚焦地址栏
+        if (modOrCtrl && ['e', 'E'].includes(key)) return true;   // 搜索
+        if (modOrCtrl && ['k', 'K'].includes(key)) return true;   // 搜索 (Firefox)
+        if (modOrCtrl && ['h', 'H'].includes(key)) return true;   // 历史
+        if (modOrCtrl && ['j', 'J'].includes(key)) return true;   // 下载
 
-        // 开发者工具
-        if (ctrlOrMeta && e.shiftKey && ['i', 'I', 'j', 'J', 'c', 'C'].includes(e.key)) return true;
-        if (e.key === 'F12') return true;
+        // ── 缩放 ──
+        if (modOrCtrl && ['=', '+', '-', '_'].includes(key)) return true;
+        if (modOrCtrl && ['0'].includes(key)) return true;  // 重置缩放
+
+        // ── 开发者工具 ──
+        if (modOrCtrl && shiftKey && ['i', 'I', 'j', 'J', 'c', 'C'].includes(key)) return true;
+        if (key === 'F12') return true;
+
+        // ── 全屏/窗口 ──
+        if (key === 'F11') return true;
+        if (key === 'Escape') return true;  // 停止加载/退出全屏
+        if (modOrCtrl && key === 'f') return true;  // 查找
+        if (modOrCtrl && ['g', 'G'].includes(key)) return true; // 查找下一个
+
+        // ── macOS 特有 ──
+        if (isMac) {
+            if (metaKey && ['h', 'H'].includes(key)) return true;  // 隐藏
+            if (metaKey && ['m', 'M'].includes(key)) return true;  // 最小化
+            if (metaKey && key === '`') return true;  // 切换窗口
+            if (metaKey && key === ',') return true;   // 偏好设置
+        }
+
+        // ── code 辅助 (键盘布局无关) ──
+        if (modOrCtrl && ['KeyL', 'KeyT', 'KeyW', 'KeyN', 'KeyR',
+                          'KeyS', 'KeyD', 'KeyF', 'KeyH', 'KeyJ',
+                          'KeyP', 'KeyU', 'KeyE', 'KeyK'].includes(code)) return true;
 
         return false;
     }

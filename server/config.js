@@ -65,4 +65,21 @@ module.exports = Object.freeze({
 
     // ── CRC32 ──
     CRC32_POLYNOMIAL: 0xEDB88320,
+
+    // ── TLS (Phase 3 安全加固) ──
+    // 生产环境通过环境变量设置:
+    //   WISON_TLS_CERT=/path/to/fullchain.pem
+    //   WISON_TLS_KEY=/path/to/privkey.pem
+    //   WISON_TLS_CA=/path/to/ca.pem     (可选, mTLS)
+    //   WISON_TLS_ENABLED=1
+    TLS_DEFAULT_CERT_PATH: process.env.WISON_TLS_CERT || '',
+    TLS_DEFAULT_KEY_PATH:  process.env.WISON_TLS_KEY  || '',
+    TLS_DEFAULT_CA_PATH:   process.env.WISON_TLS_CA   || '',
+    TLS_CIPHER_SUITE: [
+        'TLS_AES_256_GCM_SHA384',
+        'TLS_CHACHA20_POLY1305_SHA256',
+        'TLS_AES_128_GCM_SHA256',
+    ].join(':'),
+    TLS_MIN_VERSION: 'TLSv1.3',
+    TLS_HONOR_CIPHER_ORDER: true,
 });
