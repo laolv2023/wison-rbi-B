@@ -1,4 +1,30 @@
 <!DOCTYPE html>
+<!--
+  ============================================================================
+  index.html — Wison-RBI 客户端入口页面（Chrome Extension MV3）
+  ============================================================================
+
+  角色（Role）：
+    - 作为浏览器隔离（RBI）客户端的主渲染界面
+    - 承载 CanvasKit/WASM 驱动的像素级远程桌面合成
+    - 通过 Socket.IO 与 Wison-RBI 服务器通信，接收渲染指令
+    - 预加载 CanvasKit WASM 模块以提高首帧渲染速度
+
+  安全不变量（Security Invariants）：
+    - 本页面运行在 chrome-extension:// 源下，受 MV3 CSP 约束
+    - script-src 限制为 'self' + 'wasm-unsafe-eval'，禁止外链脚本
+    - object-src 限制为 'self'，禁止嵌入外部插件
+    - connect-src 仅允许 wss://，所有通信必须加密
+    - 禁止用户文本选择（user-select: none），防止 HID 事件泄漏
+    - 禁止浏览器默认触摸行为（touch-action: none）
+    - Canvas 渲染内容由服务器端控制，客户端不信任渲染指令
+    - 加载指示器隐藏逻辑仅通过 hideLoading() 函数暴露
+
+  注意：
+    - 本文件不作为独立网页运行，仅由 Chrome Extension 加载
+    - 资源路径（node_modules/...）由 web_accessible_resources 白名单控制
+  ============================================================================
+-->
 <html lang="en">
 <head>
     <meta charset="UTF-8">
@@ -83,13 +109,37 @@
         <span id="loading-text">Loading Wison-RBI...</span>
     </div>
 
-    <!-- Socket.IO 客户端 -->
+    <!--
+      Socket.IO 客户端库
+      - 提供 WebSocket 双向通信能力
+      - 自动处理重连、心跳、二进制帧传输
+      - 生产环境应使用 wss:// 协议（由 CSP 强制）
+    -->
     <script src="./node_modules/socket.io-client/dist/socket.io.min.js"></script>
-    <!-- CanvasKit WASM -->
+
+    <!--
+      CanvasKit WASM 运行时（Skia 的 WebAssembly 移植）
+      - 提供 GPU 加速的 2D 绘图 API（drawText, drawRect, drawImage 等）
+      - 字体渲染使用 Skia 的排版引擎，支持文本塑形（shaping）
+      - .wasm 文件由上面的 <link rel="preload"> 预加载，避免二次请求
+    -->
     <script src="./node_modules/canvaskit-wasm/bin/canvaskit.js"></script>
-    <!-- 应用模块（ESM） -->
+
+    <!--
+      应用主模块（ESM, type="module"）
+      - 严格模式下运行，顶层 this 为 undefined
+      - 异步加载，不阻塞 DOM 解析
+      - 负责 CanvasKit 初始化、Socket.IO 连接、渲染循环
+    -->
     <script type="module" src="./index.js"></script>
 
+    <!--
+      全局工具函数：隐藏加载指示器
+      - 由 index.js 的 init() 在 CanvasKit 初始化完成后调用
+      - 添加 .hidden 类以触发 CSS display:none
+      - 仅在 loading 元素存在时操作，避免空引用错误
+      - 函数挂在 window 上以兼容 ESM 模块访问
+    -->
     <script>
         // 加载完成后隐藏 loading 指示器
         // （由 index.js 中的 init() 调用 hideLoading）

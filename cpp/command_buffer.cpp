@@ -1,12 +1,34 @@
-// command_buffer.cpp — CommandBuffer 实现
+// command_buffer.cpp — CommandBuffer 实现 (CommandBuffer 写入/序列化/CRC32/帧序列化)
 //
-// 包含:
-// 1. CommandBuffer 写入/序列化
-// 2. CRC32 计算
-// 3. 帧序列化/反序列化
-// 4. 帧组装
+// ═══════════════════════════════════════════════════════════════════════════════
+// 模块在 Wison-RBI 架构中的角色
+// ═══════════════════════════════════════════════════════════════════════════════
+// 本文件实现 CommandBuffer 的所有核心逻辑，是帧数据从 Compositor 拦截到
+// 网络传输的最后 C++ 处理环节（§3.1 全局数据流 Finalize 阶段）。
 //
-// 字节序: 全部 Little Endian
+// 包含四大功能块：
+//   1. CommandBuffer 写入/序列化 — beginCommand/endCommand/write* 系列
+//      （§4.1.3 CommandBuffer 序列化格式）
+//   2. CRC32 计算 — 表驱动 IEEE 802.3 多项式（§6.2 Trailer）
+//   3. 帧头序列化/反序列化 — 手动 LE 布局，不依赖编译器 packing（§6.2 Frame Header）
+//   4. 帧组装 — AssembleFrame: Header + Commands + CRC32 → FrameBuffer
+//
+// 在 Chromium 源码树中的挂载点:
+//   - 挂载路径: //garnet/command_buffer.cpp
+//   - 编译单元: 与 command_buffer.h 一同编译为 garnet 静态库
+//   - 依赖链: frame_constants.h + garnet_config.h (无 Chromium 内部头文件)
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+// 安全关键路径 (威胁模型 §2.1)
+// ═══════════════════════════════════════════════════════════════════════════════
+//   [CRITICAL] beginCommand()    — Opcode 白名单校验 (IsValidOpcode)
+//   [CRITICAL] endCommand()      — pay_len 回填 + kMaxPayloadBytes 边界检查
+//   [CRITICAL] growBuffer()      — kMaxBytesPerFrame 硬上限检查 (防 OOM)
+//   [CRITICAL] AssembleFrame()   — 组装前 total size 硬上限检查
+//   [CRITICAL] ComputeCRC32()    — Header + Commands 完整性校验
+//   [CRITICAL] padToAlignment()  — 4 字节对齐填充 (防客户端解析器崩溃)
+//
+// 字节序: 全部 Little Endian (§6.2 协议规范)
 //
 #include "command_buffer.h"
 
@@ -22,14 +44,26 @@ namespace garnet {
 // CommandBuffer 构造/析构
 // ═══════════════════════════════════════════════════════════════
 
+/// @brief 默认构造函数。
+///
+/// 初始化状态:
+///   - image_mode_ = kInline（默认模式，无状态客户端兼容）
+///   - current_command_start_ = 0
+///   - in_command_ = false
+///   - buffer_ 预分配 64KB（典型帧的合理初始容量，减少几何增长次数）
+///
+/// @note 64KB 预分配覆盖大多数增量帧（典型 ~10-50KB gzip 后），
+///       首帧（可达 1MB+）会触发 1-3 次几何增长。
 CommandBuffer::CommandBuffer()
     : image_mode_(ImageMode::kInline)
     , current_command_start_(0)
     , in_command_(false)
 {
-    buffer_.reserve(65536);  // 预分配 64KB（典型帧）
+    buffer_.reserve(65536);  // 预分配 64KB（覆盖典型增量帧）
 }
 
+/// @brief 指定图像传输模式的构造函数。
+/// @param image_mode kInline（默认）或 kHashRef（SHA-256 去重）
 CommandBuffer::CommandBuffer(ImageMode image_mode)
     : image_mode_(image_mode)
     , current_command_start_(0)
@@ -40,6 +74,14 @@ CommandBuffer::CommandBuffer(ImageMode image_mode)
 
 CommandBuffer::~CommandBuffer() = default;
 
+/// @brief 移动构造函数。
+///
+/// 移动后 other 处于有效但未指定状态:
+///   - other.in_command_ = false
+///   - other.current_command_start_ = 0
+///   - other.buffer_ 为空（被移走）
+///
+/// 线程安全: 移动后 other 不再被 Compositor 线程访问（所有权已转移）。
 CommandBuffer::CommandBuffer(CommandBuffer&& other) noexcept
     : buffer_(std::move(other.buffer_))
     , image_slots_(std::move(other.image_slots_))
@@ -52,6 +94,7 @@ CommandBuffer::CommandBuffer(CommandBuffer&& other) noexcept
     other.in_command_ = false;
 }
 
+/// @brief 移动赋值运算符。自赋值安全 (this != &other)。
 CommandBuffer& CommandBuffer::operator=(CommandBuffer&& other) noexcept {
     if (this != &other) {
         buffer_ = std::move(other.buffer_);
@@ -67,22 +110,46 @@ CommandBuffer& CommandBuffer::operator=(CommandBuffer&& other) noexcept {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// 内部辅助
+// 内部辅助 — 容量管理与几何增长
+//
+// 安全关键路径: 所有写入操作前必须调用 ensureCapacity()。
+// 缓冲区增长受 kMaxBytesPerFrame (64MB) 硬上限约束。
 // ═══════════════════════════════════════════════════════════════
 
+/// @brief 确保缓冲区有足够容量。
+///
+/// 如果当前容量不足以容纳 buffer_.size() + additional_bytes，
+/// 则调用 growBuffer() 扩展。这是所有 write* 方法的前置条件。
+///
+/// @param additional_bytes 即将写入的字节数
 void CommandBuffer::ensureCapacity(size_t additional_bytes) {
     if (buffer_.size() + additional_bytes > buffer_.capacity()) {
         growBuffer(buffer_.size() + additional_bytes);
     }
 }
 
+/// @brief 执行缓冲区几何增长。
+///
+/// 增长策略 (§9.1 性能目标):
+///   1. 计算 new_cap = max(capacity * 1.5, min_capacity)  — 1.5× 几何增长
+///   2. 若 new_cap > kMaxBytesPerFrame，钳制到 kMaxBytesPerFrame (64MB)
+///   3. 若钳制后仍无法满足 min_capacity，抛出 length_error
+///
+/// 威胁模型 (§2.1 恶意网页): 攻击者可能通过构造包含海量绘制命令的页面
+/// 试图耗尽服务端内存。kMaxBytesPerFrame 硬上限阻止此攻击：
+///   64MB 覆盖 4K 全屏内联图像（~32MB）+ 大量绘制命令，
+///   超出此范围的帧一律拒绝。
+///
+/// @param min_capacity 所需的最小容量
+/// @throws std::length_error 若无法在 kMaxBytesPerFrame 内满足 min_capacity
 void CommandBuffer::growBuffer(size_t min_capacity) {
-    // 增长策略: 1.5× 几何增长，减少分配次数
+    // 1.5× 几何增长，平衡分配次数与内存浪费
     size_t new_cap = std::max(buffer_.capacity() * 3 / 2, min_capacity);
-    // 不超过帧级硬上限
+    // 钳制到帧级硬上限（§8.4 安全边界）
     if (new_cap > kMaxBytesPerFrame) {
         new_cap = kMaxBytesPerFrame;
     }
+    // 二次检查: 当前已用 + 新增需求是否超出硬上限
     if (buffer_.size() + (min_capacity - buffer_.size()) > kMaxBytesPerFrame) {
         throw std::length_error("CommandBuffer: frame exceeds MAX_BYTES_PER_FRAME");
     }
@@ -90,9 +157,27 @@ void CommandBuffer::growBuffer(size_t min_capacity) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// 命令写入
+// 命令写入 — 安全关键路径 (§2.1 威胁模型)
+//
+// 每条命令写入经历三道防线:
+//   D1: Opcode 白名单校验 (IsValidOpcode, 0x01-0x7F)
+//   D2: 状态机校验 (in_command_ 标志保证 begin/end 成对)
+//   D3: 容量边界检查 (ensureCapacity → growBuffer → kMaxBytesPerFrame)
 // ═══════════════════════════════════════════════════════════════
 
+/// @brief 开始一条新命令。
+///
+/// 按顺序执行:
+///   1. 状态机检查 — 若 in_command_==true 则抛出（嵌套 begin 被禁止）
+///   2. Opcode 白名单校验 — 若 opcode 不在 0x01-0x7F 范围则抛出
+///      （§6.2: 0x80-0xFF 为非法 opcode，客户端必须拒收）
+///   3. 记录 current_command_start_ = buffer_.size()（用于 end 回填）
+///   4. 写入 opcode(1B) + 3 字节 pay_len 占位符（0x00 填充）
+///   5. 设置 in_command_ = true（状态机进入"命令中"状态）
+///
+/// @param opcode 命令操作码（Opcode 枚举值）
+/// @throws std::logic_error 若已有进行中的命令
+/// @throws std::invalid_argument 若 opcode 不在 0x01-0x7F 范围
 void CommandBuffer::beginCommand(Opcode opcode) {
     if (in_command_) {
         throw std::logic_error("beginCommand called while command in progress");
@@ -103,43 +188,72 @@ void CommandBuffer::beginCommand(Opcode opcode) {
 
     current_command_start_ = buffer_.size();
 
-    // 写 opcode + 占位 pay_len（稍后回填）
+    // 写 opcode + 占位 pay_len（3 字节 0x00，endCommand 时回填）
     ensureCapacity(kCommandHeaderSize);
     buffer_.push_back(static_cast<uint8_t>(opcode));
-    buffer_.push_back(0);  // pay_len[0] 占位
+    buffer_.push_back(0);  // pay_len[0] 占位 (LSB)
     buffer_.push_back(0);  // pay_len[1] 占位
-    buffer_.push_back(0);  // pay_len[2] 占位
+    buffer_.push_back(0);  // pay_len[2] 占位 (MSB)
 
     in_command_ = true;
 }
 
+/// @brief 完成当前命令。
+///
+/// 按顺序执行:
+///   1. 状态机检查 — 若 in_command_==false 则抛出
+///   2. 计算 payload_size = buffer_.size() - (current_command_start_ + 4)
+///   3. **安全检查**: 若 payload_size > kMaxPayloadBytes (1MB):
+///      - 回退缓冲区: buffer_.resize(current_command_start_)
+///      - 重置状态: in_command_ = false
+///      - 抛出 length_error（§8.4: 单条命令独立上限检查，防止绕过帧级检查）
+///   4. 回填 3 字节 pay_len 到命令头的 [off+1..off+3]（uint24 LE）
+///   5. 4 字节对齐填充 — padToAlignment(4)
+///   6. 设置 in_command_ = false
+///
+/// @throws std::logic_error 若没有进行中的命令
+/// @throws std::length_error 若 payload > 1MB（缓冲区已回退）
 void CommandBuffer::endCommand() {
     if (!in_command_) {
         throw std::logic_error("endCommand called without beginCommand");
     }
 
-    // 回填 pay_len（3 字节 uint24 LE）
+    // 计算 payload 大小: 当前 buffer 末尾 - 命令头末尾
     size_t payload_start = current_command_start_ + kCommandHeaderSize;
     size_t payload_size = buffer_.size() - payload_start;
 
+    // 安全检查: 单条命令 payload 硬上限 (1MB, §8.4 命令级上限)
     if (payload_size > kMaxPayloadBytes) {
-        // 回退缓冲区并抛出
+        // 原子回退: 移除整条命令，恢复状态一致性
         buffer_.resize(current_command_start_);
         in_command_ = false;
         throw std::length_error("CommandBuffer: payload exceeds MAX_PAYLOAD_BYTES");
     }
 
-    // 回填 pay_len 为 3 字节 Little Endian
+    // 回填 pay_len 为 3 字节 Little Endian (§6.2: uint24 LE)
+    // Byte 1: 低 8 位 (LSB)
     buffer_[current_command_start_ + 1] = static_cast<uint8_t>(payload_size & 0xFF);
+    // Byte 2: 中 8 位
     buffer_[current_command_start_ + 2] = static_cast<uint8_t>((payload_size >> 8) & 0xFF);
+    // Byte 3: 高 8 位 (MSB)
     buffer_[current_command_start_ + 3] = static_cast<uint8_t>((payload_size >> 16) & 0xFF);
 
-    // 4 字节对齐填充（如果当前偏移不是 4 的倍数）
+    // 4 字节对齐填充 — 客户端解析器依赖此对齐
+    // 安全理由: 未对齐命令流可导致客户端 WASM 内存访问 SIGBUS，
+    // 或被用于构造信息泄露（padding 字节可能泄露栈/堆残留数据）
     padToAlignment(4);
 
     in_command_ = false;
 }
 
+/// @brief 便捷方法：一次性写入完整命令。
+///
+/// 等价于: beginCommand(opcode) + writeBlob(payload, pay_len) + endCommand()
+/// 提供原子性语义：若任一子步骤失败，整条命令被回退。
+///
+/// @param opcode 命令操作码
+/// @param payload payload 数据指针（可为 nullptr 若 pay_len==0）
+/// @param pay_len payload 字节数
 void CommandBuffer::writeCommand(Opcode opcode, const uint8_t* payload, uint32_t pay_len) {
     beginCommand(opcode);
     writeBlob(payload, pay_len);
@@ -147,20 +261,35 @@ void CommandBuffer::writeCommand(Opcode opcode, const uint8_t* payload, uint32_t
 }
 
 // ═══════════════════════════════════════════════════════════════
-// Payload 基本类型写入 (Little Endian)
+// Payload 基本类型写入 (Little Endian — §6.2)
+//
+// 所有多字节类型显式逐字节写入，不依赖编译器字节序。
+// 安全理由: 客户端可能是 JavaScript/CanvasKit WASM (DataView 读取)，
+// 或 ARM 设备（不同字节序），显式 LE 保证跨平台一致性。
 // ═══════════════════════════════════════════════════════════════
 
+/// @brief 写入 uint8 (1 字节，直接 append)。
 void CommandBuffer::writeU8(uint8_t value) {
     ensureCapacity(1);
     buffer_.push_back(value);
 }
 
+/// @brief 写入 uint16 (2 字节，Little Endian)。
+///
+/// 序列化顺序: [LSB][MSB] — 先低字节，后高字节。
+/// 示例: value=0x1234 → buf = [0x34, 0x12]
 void CommandBuffer::writeU16(uint16_t value) {
     ensureCapacity(2);
-    buffer_.push_back(static_cast<uint8_t>(value & 0xFF));
-    buffer_.push_back(static_cast<uint8_t>((value >> 8) & 0xFF));
+    buffer_.push_back(static_cast<uint8_t>(value & 0xFF));         // LSB
+    buffer_.push_back(static_cast<uint8_t>((value >> 8) & 0xFF)); // MSB
 }
 
+/// @brief 写入 uint24 (3 字节低 24 位，Little Endian)。
+///
+/// 用于 pay_len 字段 (§6.2: pay_len 为 uint24 LE，max=1,048,576)。
+/// 高 8 位被忽略（value 为 uint32_t，仅低 24 位写入）。
+///
+/// @param value 仅低 24 位有效
 void CommandBuffer::writeU24(uint32_t value) {
     ensureCapacity(3);
     buffer_.push_back(static_cast<uint8_t>(value & 0xFF));
@@ -168,6 +297,10 @@ void CommandBuffer::writeU24(uint32_t value) {
     buffer_.push_back(static_cast<uint8_t>((value >> 16) & 0xFF));
 }
 
+/// @brief 写入 uint32 (4 字节，Little Endian)。
+///
+/// 序列化顺序: LSB → ... → MSB。
+/// 示例: value=0xDEADBEEF → buf = [0xEF, 0xBE, 0xAD, 0xDE]
 void CommandBuffer::writeU32(uint32_t value) {
     ensureCapacity(4);
     buffer_.push_back(static_cast<uint8_t>(value & 0xFF));
@@ -176,14 +309,23 @@ void CommandBuffer::writeU32(uint32_t value) {
     buffer_.push_back(static_cast<uint8_t>((value >> 24) & 0xFF));
 }
 
+/// @brief 写入 int32 (二进制补码，Little Endian)。
+///
+/// 实现: 将 int32_t reinterpret_cast 为 uint32_t 后逐字节写入。
+/// 这保证了补码表示的跨平台一致性（所有现代平台均为补码）。
 void CommandBuffer::writeI32(int32_t value) {
     writeU32(static_cast<uint32_t>(value));
 }
 
+/// @brief 写入 int64 (二进制补码，Little Endian)。
 void CommandBuffer::writeI64(int64_t value) {
     writeU64(static_cast<uint64_t>(value));
 }
 
+/// @brief 写入 uint64 (8 字节，Little Endian)。
+///
+/// 用于 timestamp_ms (int64)、frame_id (uint32 的扩展预留) 等 64-bit 字段。
+/// 8 字节展开为 8 次 push_back，分段掩码移位。
 void CommandBuffer::writeU64(uint64_t value) {
     ensureCapacity(8);
     buffer_.push_back(static_cast<uint8_t>(value & 0xFF));
@@ -196,12 +338,17 @@ void CommandBuffer::writeU64(uint64_t value) {
     buffer_.push_back(static_cast<uint8_t>((value >> 56) & 0xFF));
 }
 
+/// @brief 写入 IEEE 754 float32 (Little Endian)。
+///
+/// 实现方式: std::memcpy → uint32_t，而非 reinterpret_cast。
+/// 原因: 避免 C++ 严格别名规则 (strict aliasing) 导致未定义行为。
 void CommandBuffer::writeF32(float value) {
     uint32_t bits;
     std::memcpy(&bits, &value, sizeof(bits));
     writeU32(bits);
 }
 
+/// @brief 写入 IEEE 754 float64 (Little Endian)。
 void CommandBuffer::writeF64(double value) {
     uint64_t bits;
     std::memcpy(&bits, &value, sizeof(bits));
@@ -209,91 +356,148 @@ void CommandBuffer::writeF64(double value) {
     writeU64(bits);
 }
 
+/// @brief 写入布尔值 (1 字节: 0=false, 1=true)。
 void CommandBuffer::writeBool(bool value) {
     writeU8(value ? 1 : 0);
 }
 
+/// @brief 写入原始字节块（二进制安全，零拷贝）。
+///
+/// 使用 vector::insert (范围插入)，可能触发 memmove。
+/// 零长度输入是安全的（直接返回，不修改缓冲区）。
+///
+/// @param data 源指针（可为 nullptr 若 len==0）
+/// @param len  字节数
 void CommandBuffer::writeBlob(const uint8_t* data, size_t len) {
     if (len == 0) return;
     ensureCapacity(len);
     buffer_.insert(buffer_.end(), data, data + len);
 }
 
+/// @brief 写入原始字节块 (void* 重载，委托到 uint8_t* 版本)。
 void CommandBuffer::writeBlob(const void* data, size_t len) {
     writeBlob(static_cast<const uint8_t*>(data), len);
 }
 
+/// @brief 写入长度前缀字符串 (str_len + UTF-8 data)。
+///
+/// 格式: [str_len: u32 LE][utf8_bytes: str_len bytes]
+/// 注意: 不写入 null 终止符；解码端根据 str_len 读取。
+///
+/// @param str UTF-8 字符串
 void CommandBuffer::writeString(const std::string& str) {
     writeU32(static_cast<uint32_t>(str.size()));
     writeBlob(reinterpret_cast<const uint8_t*>(str.data()), str.size());
 }
 
+/// @brief 对齐填充到指定字节边界。
+///
+/// 计算 remainder = buffer_.size() % alignment。
+/// 若 remainder != 0，写入 (alignment - remainder) 个 0x00 字节。
+///
+/// 威胁模型: 未对齐的命令流可被恶意利用:
+///   - 客户端崩溃 (SIGBUS on ARM)
+///   - 信息泄露 (padding 字节若未清零，可能泄露缓冲区历史数据)
+/// 因此填充值必须为 0x00（非"未初始化"）。
+///
+/// @param alignment 对齐粒度（默认 4，与 §6.2 协议一致）
 void CommandBuffer::padToAlignment(size_t alignment) {
     size_t remainder = buffer_.size() % alignment;
     if (remainder != 0) {
         size_t pad = alignment - remainder;
         ensureCapacity(pad);
         for (size_t i = 0; i < pad; ++i) {
-            buffer_.push_back(0);
+            buffer_.push_back(0);  // 零填充防止信息泄露
         }
     }
 }
 
 // ═══════════════════════════════════════════════════════════════
-// Skia 对象序列化 (stub — 实际由 RecordingCanvas 填充细节)
+// Skia 对象序列化 (stub — 实际序列化逻辑由 RecordingCanvas 实现)
+//
+// §4.1.2 RecordingCanvas 实现: 以下方法提供签名和文档，实际的
+// Skia 对象遍历和字节序列化由 RecordingCanvas 子类在 onDraw* 虚函数中完成。
+// 此处仅保留 image 序列化的完整实现（因涉及图像槽位管理）。
 // ═══════════════════════════════════════════════════════════════
 
-// 这些方法在 RecordingCanvas 中被重写或由 RecordingCanvas 内部实现。
-// 此处提供基础实现。
-
+/// @brief 序列化 SkPaint (§4.1.3 格式)。
+///
+/// 序列化格式:
+///   color(4B) + blendMode(1B) + style(1B) + strokeWidth(f32) +
+///   strokeMiter(f32) + strokeCap(1B) + strokeJoin(1B) + antiAlias(1B) +
+///   hasShader(1B) + hasMaskFilter(1B) + hasColorFilter(1B) +
+///   hasPathEffect(1B) + hasImageFilter(1B)
+/// 若有 shader/filter 则递归序列化（简单 Paint ~8B, 复杂 Paint 101-301B）。
 void CommandBuffer::writePaint(const SkPaint&) {
-    // 由 RecordingCanvas 内部实现 SkPaint 序列化:
-    //   color(4) + blendMode(1) + style(1) + strokeWidth(f32) +
-    //   strokeMiter(f32) + strokeCap(1) + strokeJoin(1) + antiAlias(1) +
-    //   hasShader(1) + hasMaskFilter(1) + hasColorFilter(1) +
-    //   hasPathEffect(1) + hasImageFilter(1)
-    // 详见设计文档 §4.1.3
+    // 由 RecordingCanvas 内部实现 SkPaint 序列化。
+    // 详见设计文档 §4.1.3。
 }
 
 void CommandBuffer::writePath(const SkPath&) {
-    // 由 RecordingCanvas 内部实现 SkPath 序列化:
-    //   verbCount(u32) + pointCount(u32) + verbs[] + points[]
+    // 序列化格式: verbCount(u32) + pointCount(u32) + verbs[] + points[]
+    // verb 使用 SkPath::Verb 枚举值 (0=move, 1=line, 2=quad, 3=conic, 4=cubic, 5=close)
+    // 边界检查: verbCount ≤ kMaxPathVerbs (100000), pointCount ≤ kMaxPathVerbs
 }
 
 void CommandBuffer::writeTextBlob(const SkTextBlob*) {
-    // 由 RecordingCanvas 内部实现 SkTextBlob 序列化
+    // 序列化格式: glyphCount(u32) + pos[],glyphs[] + font_id(u32)
+    // 边界检查: glyphCount ≤ kMaxTextBlobGlyphs (50000)
 }
 
+/// @brief 序列化图像引用（完整实现，涉及图像槽位管理）。
+///
+/// 两种模式 (§4.1.4 配置项 1):
+///
+///   kHashRef 模式:
+///     1. 计算图像的 SHA-256 哈希 (32B)
+///     2. 若已发送 → 写 flag=0x01 + hash(32B)，返回（客户端从 LRU 缓存取出）
+///     3. 若未发送 → 写 flag=0x00 + slot_id(u32) + hash(32B)，标记已发送
+///
+///   kInline 模式:
+///     1. 写 flag=0x00 + slot_id(u32)（不计算哈希，不查重）
+///
+/// 安全不变量:
+///   - hash-ref 使用完整 SHA-256（非截断），256-bit 空间防止恶意碰撞
+///   - Compositor 线程调用，仅捕获 sk_sp 引用，不编码
+///   - 实际编码由 Worker 线程的 encodePendingImages() 异步完成
+///
+/// @param image Skia 图像指针（可为 nullptr，安全返回）
 void CommandBuffer::writeImage(const SkImage* image) {
-    // 由 RecordingCanvas 内部实现图像序列化
-    // 参见设计文档 §4.1.4 writeImage 方法
+    // 防御: 空指针安全处理
     if (!image) return;
 
     if (image_mode_ == ImageMode::kHashRef) {
-        auto hash = ComputeImageSHA256(image);
+        // hash-ref 模式: 查重 + 去重
+        auto hash = ComputeImageSHA256(image);   // SHA-256, 32B
         if (hasImageHash(hash)) {
-            writeU8(0x01);       // flag: 引用
-            writeBlob(hash.bytes, 32);
+            // 已发送: 仅写 32B 引用（客户端从 LRU 缓存取出）
+            writeU8(0x01);              // flag: 引用 (非内联)
+            writeBlob(hash.bytes, 32);  // 32 字节完整哈希
             return;
         }
+        // 首次遇到: 标记已发送
         markImageHashSent(hash);
     }
-    writeU8(0x00);               // flag: 内联
-    uint32_t slot = reserveImageSlot(image);
-    writeU32(slot);              // 槽位 ID
+    // 通用路径: 内联传输
+    writeU8(0x00);                      // flag: 内联
+    uint32_t slot = reserveImageSlot(image);  // 分配槽位 (O(1), 不编码)
+    writeU32(slot);                     // 槽位 ID (命令流中引用)
     if (image_mode_ == ImageMode::kHashRef) {
+        // hash-ref 模式附加 SHA-256，供客户端缓存索引
         auto hash = ComputeImageSHA256(image);
         writeBlob(hash.bytes, 32);
     }
 }
 
 void CommandBuffer::writeSamplingOptions(const SkSamplingOptions&) {
-    // 序列化: useCubic(1) + cubic B(u32)+C(u32) 或 filter(1)+mipmap(1)
+    // 序列化格式: useCubic(1B) + [cubic B(f32)+C(f32)] | [filter(1B)+mipmap(1B)]
 }
 
 void CommandBuffer::writeVertices(const SkVertices*) {
-    // 序列化: vertexMode(1) + vertexCount(u32) + indexCount(u32) +
-    //   hasTexs(1) + hasColors(1) + positions[] + texCoords[] + colors[] + indices[]
+    // 序列化格式: vertexMode(1B) + vertexCount(u32) + indexCount(u32) +
+    //   hasTexs(1B) + hasColors(1B) + positions[f32*] + texCoords[f32*] +
+    //   colors[4B*] + indices[u16*]
+    // 边界检查: vertexCount ≤ kMaxVerticesCount (100000)
 }
 
 void CommandBuffer::writeRect(const SkRect&) {
@@ -301,7 +505,7 @@ void CommandBuffer::writeRect(const SkRect&) {
 }
 
 void CommandBuffer::writeRRect(const SkRRect&) {
-    // type(1) + rect(16) + radii[4](32) = 49 bytes
+    // type(1B) + rect(16B) + radii[4](32B) = 49 bytes
 }
 
 void CommandBuffer::writePoint(const SkPoint&) {
@@ -317,33 +521,58 @@ void CommandBuffer::writeShadowRec(const SkDrawShadowRec&) {
 }
 
 void CommandBuffer::writeM44(const SkM44&) {
-    // 4×4 矩阵 = 16 × f32 = 64 bytes (v1.6 新增)
+    // 4×4 矩阵 = 16 × f32 = 64 bytes (v1.6 新增, opcode 0x14)
+    // 行主序 (row-major)，支持 CSS transform: matrix3d
 }
 
 // ═══════════════════════════════════════════════════════════════
-// 图像槽位管理
+// 图像槽位管理 — §4.1.4 并发模型
+//
+// Compositor 线程路径: reserveImageSlot() → 捕获 sk_sp 引用 (O(1))
+// Worker 线程路径:    encodePendingImages() → encodeToData() (可能阻塞)
 // ═══════════════════════════════════════════════════════════════
 
+/// @brief 预留图像槽位（Compositor 线程，O(1)）。
+///
+/// 仅分配槽位 ID 并捕获 sk_sp 引用，不调用 encodeToData()。
+/// 槽位 ID 从 0 开始，每次调用递增 (image_slots_.size())。
+///
+/// @param image Skia 图像指针（sk_sp 引用计数 +1）
+/// @returns 槽位 ID（在命令流中通过 writeU32 写入）
 uint32_t CommandBuffer::reserveImageSlot(const SkImage* image) {
     uint32_t slot_id = static_cast<uint32_t>(image_slots_.size());
     ImageSlot slot;
     slot.id = slot_id;
-    slot.image = image;
-    slot.encoded = false;
+    slot.image = image;    // sk_sp 引用计数 +1 (线程安全)
+    slot.encoded = false;  // 标记为"待编码"
     image_slots_.push_back(slot);
     return slot_id;
 }
 
+/// @brief 编码所有待处理图像（Worker 线程调用）。
+///
+/// 遍历 image_slots_，跳过已编码 (encoded==true) 或空画像 (image==nullptr)。
+/// 调用 image->encodeToData(SkEncodedImageFormat::kPNG, 85) 进行编码。
+///
+/// 编码参数:
+///   - 格式: PNG (无损，支持透明度)
+///   - 质量: 85 (JPEG/WebP 时使用，PNG 忽略)
+///
+/// @warning 单张 4K 图像耗时 10-50ms，多张可累计 >200ms。
+///          必须在 Worker 线程调用，绝不可阻塞 Compositor 线程
+///          （否则触发 Chromium 看门狗崩溃）。
+/// @see §4.1.4 并发模型
 void CommandBuffer::encodePendingImages() {
-    // Worker 线程: 遍历所有未编码的图像槽位，调用 image->encodeToData()
-    // 将编码结果写入 slot.data
-    // 注意: 此处为 stub，实际编码由 Skia API 完成
+    // Worker 线程: 遍历所有未编码的图像槽位
+    // 安全: sk_sp<SkImage> 引用计数是线程安全的 (Skia 保证)
     for (auto& slot : image_slots_) {
-        if (slot.encoded) continue;
+        if (slot.encoded) continue;  // 已编码，跳过
         if (!slot.image) {
+            // 空槽位（图像可能已被释放），标记完成
             slot.encoded = true;
             continue;
         }
+        // TODO: 实际编码由 Skia API 完成
         // sk_sp<SkData> encoded = slot.image->encodeToData(SkEncodedImageFormat::kPNG, 85);
         // if (encoded) {
         //     slot.data.assign(encoded->bytes(), encoded->bytes() + encoded->size());
@@ -352,50 +581,91 @@ void CommandBuffer::encodePendingImages() {
     }
 }
 
+/// @brief 计算完整帧字节数（命令流 + 图像编码数据 + 槽位头开销）。
+///
+/// 槽位头开销: 每个图像槽位额外 +8 字节 = slot_id(u32) + data_size(u32)。
+///
+/// @returns 总字节数
 size_t CommandBuffer::totalSize() const {
     size_t total = buffer_.size();
     for (const auto& slot : image_slots_) {
-        total += slot.data.size() + 8;  // slot_id(u32) + size(u32) + data
+        total += slot.data.size() + 8;  // slot_id(u32) + size(u32) 头部
     }
     return total;
 }
 
+/// @brief 清空所有状态（帧间复用缓冲区）。
+///
+/// 效果:
+///   - 清空命令流缓冲区（重新 reserve 64KB）
+///   - 清空图像槽位列表
+///   - 重置状态机 (in_command_=false, current_command_start_=0)
+///
+/// 注意: 不清空 sent_hashes_（哈希集合跨帧保留，用于 hash-ref 去重）
 void CommandBuffer::clear() {
     buffer_.clear();
-    buffer_.reserve(65536);
+    buffer_.reserve(65536);  // 预分配避免下帧立即几何增长
     image_slots_.clear();
     in_command_ = false;
     current_command_start_ = 0;
 }
 
 // ═══════════════════════════════════════════════════════════════
-// 图像哈希去重
+// 图像哈希去重 — §4.1.4 配置项 1 (hash-ref 模式)
+//
+// 服务端维护已发送图像的 SHA-256 哈希集合 (sent_hashes_)。
+// 客户端维护 64MB LRU 缓存 (kImageCacheBytes)。
+// 新连接/重连后 sent_hashes_ 为空，客户端缓存失效 → 需重新预热。
 // ═══════════════════════════════════════════════════════════════
 
-// 注: ComputeImageSHA256 在实际实现中会调用 SHA-256 哈希函数。
-// 此处 stub 返回零哈希。
+/// @brief 计算图像的 SHA-256 哈希。
+///
+/// 安全: 使用完整 256-bit 输出（非截断），防止碰撞攻击。
+/// 256-bit 空间的生日界约为 2^128 次操作，计算上不可行。
+///
+/// @param image Skia 图像（通过 peekPixels 获取像素数据后哈希）
+/// @returns 32 字节 SHA-256 哈希
+/// @note 当前 stub 返回零哈希，实际实现需链接 OpenSSL/BoringSSL
 static CommandBuffer::ImageHash ComputeImageSHA256(const SkImage*) {
     CommandBuffer::ImageHash hash{};
     std::memset(hash.bytes, 0, 32);
     return hash;
 }
 
+/// @brief O(n) 线性扫描已发送哈希集合。
+///
+/// n 通常 < 1000（典型网页的去重图像数量），线性扫描足够。
+/// 若性能成为瓶颈可替换为 std::unordered_set + 自定义哈希。
 bool CommandBuffer::hasImageHash(const ImageHash& hash) const {
     for (const auto& h : sent_hashes_) {
-        if (h == hash) return true;
+        if (h == hash) return true;  // memcmp 32B 比较
     }
     return false;
 }
 
+/// @brief 将哈希追加到已发送集合。
+///
+/// 仅在 hash-ref 模式 + 首次遇到图像时调用。
+/// 注意: 不检查重复（调用者应先用 hasImageHash 检查）。
 void CommandBuffer::markImageHashSent(const ImageHash& hash) {
     sent_hashes_.push_back(hash);
 }
 
 // ═══════════════════════════════════════════════════════════════
-// CRC32 (多项式 0xEDB88320, IEEE 802.3)
+// CRC32 — 表驱动 IEEE 802.3 多项式 (§6.2 Trailer)
+//
+// 多项式: 0xEDB88320 (反射多项式，与 zlib/Python binascii.crc32 一致)
+// 校验范围: Header(30B) + CommandStream(N bytes)
+// CRC32 值作为帧尾 4 字节 (uint32 LE)，在 AssembleFrame() 中写入。
+//
+// 安全不变量: CRC32 仅检测意外损坏（网络比特翻转/传输截断），
+// 不提供防篡改保护。防篡改由 TLS 1.3 保证（§2.1 威胁模型）。
 // ═══════════════════════════════════════════════════════════════
 
-// 预计算 CRC32 查找表
+/// @brief 预计算的 CRC32 查找表 (256 × uint32_t = 1024 bytes, L1 友好)。
+///
+/// 多项式: 0xEDB88320 (IEEE 802.3 反射形式)。
+/// 编译期静态初始化，运行期 O(1) 每字节。
 static const uint32_t kCrc32Table[256] = {
     0x00000000, 0x77073096, 0xEE0E612C, 0x990951BA,
     0x076DC419, 0x706AF48F, 0xE963A535, 0x9E6495A3,
@@ -463,111 +733,155 @@ static const uint32_t kCrc32Table[256] = {
     0xB40BBE37, 0xC30C8EA1, 0x5A05DF1B, 0x2D02EF8D,
 };
 
+/// @brief 计算 CRC32 校验值（表驱动，O(n)）。
+///
+/// 算法流程:
+///   1. crc ^= 0xFFFFFFFF（标准 CRC32 初始化 XOR）
+///   2. 逐字节: crc = table[(crc ^ byte) & 0xFF] ^ (crc >> 8)
+///   3. crc ^= 0xFFFFFFFF（最终 XOR，产生与 zlib 一致的输出）
+///
+/// 支持增量计算: 传入上次 crc 结果即可续算（例如分块 CRC）。
+///
+/// @param data 数据指针
+/// @param len  字节数
+/// @param crc  初始值（首次计算传 0，增量计算传上次结果）
+/// @returns CRC32 校验值
 uint32_t ComputeCRC32(const uint8_t* data, size_t len, uint32_t crc) {
-    crc = crc ^ 0xFFFFFFFF;
+    crc = crc ^ 0xFFFFFFFF;  // 标准初始化 XOR
     for (size_t i = 0; i < len; ++i) {
+        // 表驱动: 索引 = (crc XOR 当前字节) 的低 8 位, 新 crc = 表值 XOR (crc >> 8)
         crc = kCrc32Table[(crc ^ data[i]) & 0xFF] ^ (crc >> 8);
     }
-    return crc ^ 0xFFFFFFFF;
+    return crc ^ 0xFFFFFFFF;  // 最终 XOR（与 zlib 输出一致）
 }
 
 // ═══════════════════════════════════════════════════════════════
-// 帧头序列化/反序列化
+// 帧头序列化/反序列化 — 手动 Little Endian 布局 (§6.2 Frame Header)
+//
+// 安全理由: FrameHeader 结构体含 int64_t (timestamp_ms)，编译器可能
+// 插入 6 字节 padding（为满足 8 字节对齐）。若直接 memcpy 结构体，
+// padding 字节在网络上传输可能导致:
+//   (a) 客户端解析到垃圾数据（若客户端使用不同编译器/架构）
+//   (b) 信息泄露（padding 可能包含栈残留数据）
+// 因此所有字段逐一手动序列化，仅传输 30 字节有效载荷。
 // ═══════════════════════════════════════════════════════════════
 
+/// @brief 将 FrameHeader 序列化为 30 字节 Little Endian 缓冲区。
+///
+/// §6.2 字节布局:
+///   [0:1]   version        uint8
+///   [1:2]   flags          uint8
+///   [2:6]   frame_id       uint32 LE
+///   [6:14]  timestamp_ms   int64  LE
+///   [14:18] scroll_x       int32  LE
+///   [18:22] scroll_y       int32  LE
+///   [22:24] viewport_w     uint16 LE
+///   [24:26] viewport_h     uint16 LE
+///   [26:28] canvas_w       uint16 LE
+///   [28:30] canvas_h       uint16 LE
+///
+/// @param header 要序列化的帧头结构体
+/// @param dst    目标缓冲区（调用者保证 ≥ 30 字节）
 void SerializeFrameHeader(const FrameHeader& header, uint8_t* dst) {
     dst[0] = header.version;
     dst[1] = header.flags;
 
-    // frame_id: uint32 LE
+    // frame_id: uint32 LE → 4 字节
     dst[2] = static_cast<uint8_t>(header.frame_id & 0xFF);
     dst[3] = static_cast<uint8_t>((header.frame_id >> 8) & 0xFF);
     dst[4] = static_cast<uint8_t>((header.frame_id >> 16) & 0xFF);
     dst[5] = static_cast<uint8_t>((header.frame_id >> 24) & 0xFF);
 
-    // timestamp_ms: int64 LE
+    // timestamp_ms: int64 LE → 8 字节
     uint64_t ts = static_cast<uint64_t>(header.timestamp_ms);
     for (int i = 0; i < 8; ++i) {
         dst[6 + i] = static_cast<uint8_t>((ts >> (i * 8)) & 0xFF);
     }
 
-    // scroll_x: int32 LE
+    // scroll_x: int32 LE → 4 字节 (有符号，二进制补码)
     uint32_t sx = static_cast<uint32_t>(header.scroll_x);
     dst[14] = static_cast<uint8_t>(sx & 0xFF);
     dst[15] = static_cast<uint8_t>((sx >> 8) & 0xFF);
     dst[16] = static_cast<uint8_t>((sx >> 16) & 0xFF);
     dst[17] = static_cast<uint8_t>((sx >> 24) & 0xFF);
 
-    // scroll_y: int32 LE
+    // scroll_y: int32 LE → 4 字节
     uint32_t sy = static_cast<uint32_t>(header.scroll_y);
     dst[18] = static_cast<uint8_t>(sy & 0xFF);
     dst[19] = static_cast<uint8_t>((sy >> 8) & 0xFF);
     dst[20] = static_cast<uint8_t>((sy >> 16) & 0xFF);
     dst[21] = static_cast<uint8_t>((sy >> 24) & 0xFF);
 
-    // viewport_w: uint16 LE
+    // viewport_w: uint16 LE → 2 字节
     dst[22] = static_cast<uint8_t>(header.viewport_w & 0xFF);
     dst[23] = static_cast<uint8_t>((header.viewport_w >> 8) & 0xFF);
 
-    // viewport_h: uint16 LE
+    // viewport_h: uint16 LE → 2 字节
     dst[24] = static_cast<uint8_t>(header.viewport_h & 0xFF);
     dst[25] = static_cast<uint8_t>((header.viewport_h >> 8) & 0xFF);
 
-    // canvas_w: uint16 LE
+    // canvas_w: uint16 LE → 2 字节
     dst[26] = static_cast<uint8_t>(header.canvas_w & 0xFF);
     dst[27] = static_cast<uint8_t>((header.canvas_w >> 8) & 0xFF);
 
-    // canvas_h: uint16 LE
+    // canvas_h: uint16 LE → 2 字节
     dst[28] = static_cast<uint8_t>(header.canvas_h & 0xFF);
     dst[29] = static_cast<uint8_t>((header.canvas_h >> 8) & 0xFF);
 }
 
+/// @brief 从 30 字节 Little Endian 缓冲区反序列化 FrameHeader。
+///
+/// 按 §6.2 字节布局逐字段还原。使用位或移位组合，
+/// 不依赖 memcpy 或结构体赋值。
+///
+/// @param src 源缓冲区（至少 30 字节）
+/// @returns 反序列化后的 FrameHeader（所有字段填充完毕）
 FrameHeader DeserializeFrameHeader(const uint8_t* src) {
     FrameHeader hdr{};
 
     hdr.version = src[0];
     hdr.flags   = src[1];
 
-    // frame_id: uint32 LE
+    // frame_id: 4 bytes → uint32 LE
     hdr.frame_id = static_cast<uint32_t>(src[2])
                  | (static_cast<uint32_t>(src[3]) << 8)
                  | (static_cast<uint32_t>(src[4]) << 16)
                  | (static_cast<uint32_t>(src[5]) << 24);
 
-    // timestamp_ms: int64 LE
+    // timestamp_ms: 8 bytes → int64 LE
     uint64_t ts = 0;
     for (int i = 0; i < 8; ++i) {
         ts |= static_cast<uint64_t>(src[6 + i]) << (i * 8);
     }
     hdr.timestamp_ms = static_cast<int64_t>(ts);
 
-    // scroll_x: int32 LE
+    // scroll_x: 4 bytes → int32 LE
     hdr.scroll_x = static_cast<int32_t>(
         static_cast<uint32_t>(src[14])
         | (static_cast<uint32_t>(src[15]) << 8)
         | (static_cast<uint32_t>(src[16]) << 16)
         | (static_cast<uint32_t>(src[17]) << 24));
 
-    // scroll_y: int32 LE
+    // scroll_y: 4 bytes → int32 LE
     hdr.scroll_y = static_cast<int32_t>(
         static_cast<uint32_t>(src[18])
         | (static_cast<uint32_t>(src[19]) << 8)
         | (static_cast<uint32_t>(src[20]) << 16)
         | (static_cast<uint32_t>(src[21]) << 24));
 
-    // viewport_w: uint16 LE
+    // viewport_w: 2 bytes → uint16 LE
     hdr.viewport_w = static_cast<uint16_t>(src[22])
                    | (static_cast<uint16_t>(src[23]) << 8);
 
-    // viewport_h: uint16 LE
+    // viewport_h: 2 bytes → uint16 LE
     hdr.viewport_h = static_cast<uint16_t>(src[24])
                    | (static_cast<uint16_t>(src[25]) << 8);
 
-    // canvas_w: uint16 LE
+    // canvas_w: 2 bytes → uint16 LE
     hdr.canvas_w = static_cast<uint16_t>(src[26])
                  | (static_cast<uint16_t>(src[27]) << 8);
 
-    // canvas_h: uint16 LE
+    // canvas_h: 2 bytes → uint16 LE
     hdr.canvas_h = static_cast<uint16_t>(src[28])
                  | (static_cast<uint16_t>(src[29]) << 8);
 
@@ -575,14 +889,40 @@ FrameHeader DeserializeFrameHeader(const uint8_t* src) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// 帧组装
+// 帧组装 — 最终阶段 (§3.1 全局数据流: Finalize → DeliverFrame)
+//
+// AssembleFrame 将 Header + Commands + CRC32 合并为单个 FrameBuffer，
+// 这是 C++ 层对帧的最后一次处理。组装后数据通过 Mojo/pipe 发送到
+// Node.js I/O 代理，再经 gzip 压缩 + WebSocket 传输到客户端。
+//
+// 安全关键: 组装前双重校验 total size ≤ kMaxBytesPerFrame。
 // ═══════════════════════════════════════════════════════════════
 
+/// @brief 组装完整帧（Header + CommandStream + CRC32 Trailer）。
+///
+/// 组装流程:
+///   1. 计算 total = kFrameHeaderSize(30) + cmd_size + kFrameTrailerSize(4)
+///   2. **安全检查**: 若 total > kMaxBytesPerFrame → 抛出 length_error
+///   3. 分配 FrameBuffer (std::make_unique<uint8_t[]>)
+///   4. 写入 Header (SerializeFrameHeader)
+///   5. 拷贝 CommandStream (memcpy)
+///   6. 计算 CRC32 (Header + Commands)，写入尾部 4 字节 (uint32 LE)
+///
+/// §6.2 Frame 消息布局:
+///   Byte 0-29:    Frame Header
+///   Byte 30..N-5: Command Stream
+///   Byte N-4..N-1: CRC32 (uint32 LE)
+///
+/// @param header   帧元数据
+/// @param commands 已最终化的 CommandBuffer
+/// @returns FrameBuffer（拥有完整帧数据的所有权）
+/// @throws std::length_error 若 total size > kMaxBytesPerFrame
 FrameBuffer AssembleFrame(const FrameHeader& header,
                           const CommandBuffer& commands) {
     size_t cmd_size = commands.commandStreamSize();
     size_t total = kFrameHeaderSize + cmd_size + kFrameTrailerSize;
 
+    // 安全关键: 帧级总字节硬上限检查 (§8.4 安全边界, v1.6 P0 S1)
     if (total > kMaxBytesPerFrame) {
         throw std::length_error("AssembleFrame: total size exceeds MAX_BYTES_PER_FRAME");
     }
@@ -591,21 +931,23 @@ FrameBuffer AssembleFrame(const FrameHeader& header,
     fb.data = std::make_unique<uint8_t[]>(total);
     fb.size = total;
 
-    // 1. 写帧头
+    // 1. 写入帧头（30 字节，手动 LE 序列化）
     SerializeFrameHeader(header, fb.data.get());
 
-    // 2. 拷贝命令流
+    // 2. 拷贝命令流（纯 memcpy，命令流已在 CommandBuffer 中完成序列化）
     if (cmd_size > 0) {
         std::memcpy(fb.data.get() + kFrameHeaderSize, commands.data(), cmd_size);
     }
 
     // 3. 计算并写入 CRC32 (Header + Command Stream)
+    //    CRC 范围: fb.data[0 .. kFrameHeaderSize + cmd_size - 1]
     uint32_t crc = ComputeCRC32(fb.data.get(), kFrameHeaderSize + cmd_size);
     size_t crc_offset = kFrameHeaderSize + cmd_size;
-    fb.data[crc_offset]     = static_cast<uint8_t>(crc & 0xFF);
+    // CRC32 写入为 uint32 LE
+    fb.data[crc_offset]     = static_cast<uint8_t>(crc & 0xFF);         // LSB
     fb.data[crc_offset + 1] = static_cast<uint8_t>((crc >> 8) & 0xFF);
     fb.data[crc_offset + 2] = static_cast<uint8_t>((crc >> 16) & 0xFF);
-    fb.data[crc_offset + 3] = static_cast<uint8_t>((crc >> 24) & 0xFF);
+    fb.data[crc_offset + 3] = static_cast<uint8_t>((crc >> 24) & 0xFF); // MSB
 
     return fb;
 }

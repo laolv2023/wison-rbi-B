@@ -1,17 +1,50 @@
 // server.js — Wison-RBI 服务端主入口
 //
-// 职责:
-//   1. WebSocket 服务（接收客户端连接）
-//   2. 会话生命周期管理
-//   3. Chromium 实例池管理
-//   4. 帧路由（Chromium → 客户端）
-//   5. 输入路由（客户端 → Chromium）
+// === 模块角色 ===
+// 本模块是 Wison-RBI 系统的**服务端中枢**。
+// 架构角色: 编排器 (Orchestrator) — 负责:
+//   1. WebSocket 服务（接收客户端连接，TLS 1.3 可选）
+//   2. 会话生命周期管理（创建→初始化 Chromium→绑定 InputProxy→关闭）
+//   3. 消息路由（客户端 JSON 消息 → 类型分发 → 具体处理）
+//   4. 帧路由（Chromium CommandStream → 帧组装+压缩 → WebSocket 二进制帧）
+//   5. 输入路由（客户端 HID 事件 → InputProxy → CDP 注入）
+//   6. 健康检查 & 指标暴露 (/health + /metrics 端点)
 //
-// 安全不变量:
-//   - 不向客户端传输 HTML/CSS/JS
-//   - 输入事件仅做坐标转换，不解析页面语义
-//   - 所有帧经过 CRC32 校验和组装
+// === 安全不变量 (§2.2) ===
+//   不变量 1: 不向客户端传输 HTML/CSS/JS — 仅传输经过 CRC32 校验的帧二进制
+//   不变量 2: 输入事件仅做坐标转换，不解析页面语义 — 委托给 InputProxy
+//   不变量 3: 所有页面内容在 Chromium 沙箱内执行 — 通过 ChromiumPool 管理
 //
+// === 数据流方向 ===
+//   ┌─────────────────────────────────────────────────────────┐
+//   │  客户端 WebSocket                                       │
+//   │    ↓ JSON {type:'ready'|'viewport'|'io'|...}           │
+//   │  _handleMessage() → 类型分发                            │
+//   │    ├─ 'ready'    → _handleReady() → InputProxy.navigate()
+//   │    ├─ 'viewport' → InputProxy.updateViewport()
+//   │    ├─ 'io'       → InputProxy.handleIOEvent()
+//   │    └─ 'request_keyframe' → 设置标志位
+//   │                                                         │
+//   │  Chromium (via CDP) → sendFrame()                       │
+//   │    → assembleFrame() + compressFrame()                  │
+//   │    → ws.send(binaryBuffer) → 客户端                     │
+//   └─────────────────────────────────────────────────────────┘
+//
+// === 威胁模型 (§2.1) ===
+//   - 信道中间人: TLS 1.3 (AEAD 套件) + CRC32 完整性校验
+//     注: CRC32 在 TLS 之上提供第二层传输错误检测，非防篡改
+//   - 服务端被入侵: CommandStream 白名单在客户端执行（不在本模块），
+//     但本模块确保帧结构合规 + 压缩炸弹防护
+//   - DoS: 最大会话数限制 (maxSessions) + WebSocket payload 限制 (64MB)
+//
+// === 设计文档交叉引用 ===
+//   §2.1 — 威胁模型（TLS 1.3 配置）
+//   §2.2 — 核心安全不变量（客户端不接收 HTML/CSS/JS）
+//   §4   — 服务端设计: 会话管理 / Chromium 池 / 帧路由
+//   §6   — 通信协议规范（帧结构、压缩、CRC32）
+//   §7   — 帧元数据与输入同步（方案 B）
+//   §8   — 错误处理: request_keyframe 触发机制 / version_error 协议协商
+//   §10  — 审计清单
 
 'use strict';
 
@@ -48,28 +81,32 @@ const {
 } = require('./config');
 
 // ═══════════════════════════════════════════════════════════════
-// WisonRBI Server
+// WisonRBI Server (§4)
 // ═══════════════════════════════════════════════════════════════
 
 class WisonRBIServer {
     /**
-     * @param {object} [options]
-     * @param {number} [options.port=3000] - HTTP/WebSocket 端口
-     * @param {string} [options.chromiumPath] - Chromium 可执行路径
-     * @param {number} [options.maxSessions=4] - 最大并发会话数
-     * @param {string} [options.tlsCert] - TLS 证书路径 (PEM)
-     * @param {string} [options.tlsKey]  - TLS 私钥路径 (PEM)
-     * @param {string} [options.tlsCa]   - CA 证书路径 (mTLS, 可选)
+     * 创建 Wison-RBI 服务端实例。
+     *
+     * @param {object} [options] - 配置选项
+     * @param {number} [options.port=3000]        - HTTP/WebSocket 监听端口
+     * @param {string} [options.chromiumPath]     - Chromium 可执行文件路径
+     * @param {number} [options.maxSessions=4]    - 最大并发会话数（防 DoS）
+     * @param {string} [options.tlsCert]          - TLS 证书路径 (PEM, §2.1)
+     * @param {string} [options.tlsKey]           - TLS 私钥路径 (PEM, §2.1)
+     * @param {string} [options.tlsCa]            - CA 证书路径 (mTLS 可选, §2.1)
      */
     constructor(options = {}) {
         this._port = options.port || 3000;
         this._chromiumPath = options.chromiumPath || 'chromium';
         this._maxSessions = options.maxSessions || 4;
 
-        // ── TLS 配置 (Phase 3 安全加固) ──
+        // ── TLS 配置 (§2.1, Phase 3 安全加固) ──
+        // TLS 1.3 + AEAD 密码套件强制
         const tlsCert = options.tlsCert || TLS_DEFAULT_CERT_PATH;
         const tlsKey  = options.tlsKey  || TLS_DEFAULT_KEY_PATH;
         const tlsCa   = options.tlsCa   || TLS_DEFAULT_CA_PATH;
+        // TLS 启用条件: 同时提供 cert 和 key
         this._tlsEnabled = !!(tlsCert && tlsKey);
 
         let server;
@@ -77,14 +114,15 @@ class WisonRBIServer {
             const tlsOptions = {
                 cert: fs.readFileSync(tlsCert),
                 key:  fs.readFileSync(tlsKey),
-                ciphers: TLS_CIPHER_SUITE,
-                minVersion: TLS_MIN_VERSION,
-                honorCipherOrder: TLS_HONOR_CIPHER_ORDER,
+                ciphers: TLS_CIPHER_SUITE,           // 仅 AEAD 套件
+                minVersion: TLS_MIN_VERSION,          // 强制 TLS 1.3
+                honorCipherOrder: TLS_HONOR_CIPHER_ORDER, // 服务端决定套件优先级
             };
+            // mTLS: 若提供 CA 证书，启用双向认证
             if (tlsCa) {
                 tlsOptions.ca = fs.readFileSync(tlsCa);
                 tlsOptions.requestCert = true;
-                tlsOptions.rejectUnauthorized = true;
+                tlsOptions.rejectUnauthorized = true;  // 拒绝未提供有效证书的客户端
             }
             server = https.createServer(tlsOptions, (req, res) => {
                 this._handleHttpRequest(req, res);
@@ -99,18 +137,21 @@ class WisonRBIServer {
         this._httpServer = server;
 
         // ── WebSocket Server ──
+        // maxPayload: 64MB (与 MAX_BYTES_PER_FRAME 一致, §6.3)
+        // WebSocket 协议层限制，防止超大消息耗尽内存
         this._wsServer = new WsServer({
-            server: this._httpServer,
-            maxPayload: 64 * 1024 * 1024,  // 64MB (与 MAX_BYTES_PER_FRAME 一致)
+            server: this._httpServer,          // 复用 HTTP server
+            maxPayload: 64 * 1024 * 1024,      // 64MB (与 MAX_BYTES_PER_FRAME 一致)
         });
 
         // ── 会话管理 ──
-        this._sessions = new Map();  // sessionId → Session
+        // Map<sessionId, Session> — O(1) 查找/插入/删除
+        this._sessions = new Map();
 
-        // ── Chromium 实例池 ──
+        // ── Chromium 实例池 (§4) ──
         this._chromiumPool = new ChromiumPool({
             executablePath: this._chromiumPath,
-            maxInstances: this._maxSessions,
+            maxInstances: this._maxSessions,   // 每个会话最多一个实例
         });
 
         // ── 绑定 WebSocket 事件 ──
@@ -119,7 +160,9 @@ class WisonRBIServer {
             console.error('[server] WebSocket server error:', err.message);
         });
 
-        // ── 优雅关闭 ──
+        // ── 优雅关闭 (§8) ──
+        // SIGTERM: Kubernetes/Docker 终止信号
+        // SIGINT:  Ctrl+C 中断
         process.on('SIGTERM', () => this.shutdown());
         process.on('SIGINT', () => this.shutdown());
     }
@@ -128,8 +171,14 @@ class WisonRBIServer {
     // HTTP 请求处理
     // ═══════════════════════════════════════════════════════════
 
+    /**
+     * HTTP 请求处理器 — 提供 /metrics 和 /health 端点。
+     *
+     * @param {http.IncomingMessage} req
+     * @param {http.ServerResponse}  res
+     */
     _handleHttpRequest(req, res) {
-        // 指标端点 (Prometheus 兼容)
+        // 指标端点 — Prometheus 兼容 JSON 格式
         if (req.url === '/metrics') {
             const snap = metrics.snapshot();
             res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -137,12 +186,13 @@ class WisonRBIServer {
             return;
         }
 
-        // 健康检查端点
+        // 健康检查端点 — 综合状态 + 告警 (§10)
         if (req.url === '/health') {
             const snap = metrics.snapshot();
             const alerts = checkAlerts();
             res.writeHead(200, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({
+                // status: 'ok' 若无告警，'degraded' 若有告警
                 status: alerts.length > 0 ? 'degraded' : 'ok',
                 sessions: this._sessions.size,
                 uptime: process.uptime(),
@@ -156,6 +206,7 @@ class WisonRBIServer {
             }));
             return;
         }
+        // 未知路径 → 404
         res.writeHead(404);
         res.end();
     }
@@ -164,6 +215,11 @@ class WisonRBIServer {
     // 启动/关闭
     // ═══════════════════════════════════════════════════════════
 
+    /**
+     * 启动 HTTP/WebSocket 服务器。
+     *
+     * @returns {Promise<void>} 服务器开始监听后 resolve
+     */
     async start() {
         return new Promise((resolve) => {
             this._httpServer.listen(this._port, () => {
@@ -174,6 +230,18 @@ class WisonRBIServer {
         });
     }
 
+    /**
+     * 优雅关闭 — 清理所有资源后退出。
+     *
+     * 关闭顺序:
+     *   1. 关闭所有 WebSocket 连接（通知客户端）
+     *   2. 关闭所有 Chromium 实例（SIGTERM → SIGKILL）
+     *   3. 关闭 WebSocket Server
+     *   4. 关闭 HTTP Server
+     *   5. process.exit(0)
+     *
+     * @returns {Promise<void>}
+     */
     async shutdown() {
         console.log('[server] Shutting down...');
 
@@ -195,9 +263,25 @@ class WisonRBIServer {
     }
 
     // ═══════════════════════════════════════════════════════════
-    // WebSocket 连接处理
+    // WebSocket 连接处理 (§4)
     // ═══════════════════════════════════════════════════════════
 
+    /**
+     * WebSocket 连接建立回调。
+     *
+     * 处理流程:
+     *   1. 生成唯一 sessionId (UUID v4)
+     *   2. 记录指标 (SESSIONS_ACTIVE, SESSIONS_TOTAL, WS_CONNECTIONS)
+     *   3. 创建 Session + 绑定 WebSocket
+     *   4. 从 ChromiumPool 获取实例 → 创建 InputProxy
+     *   5. 绑定 message/close/error 事件处理器
+     *   6. 启动背压监控定时器
+     *
+     * 错误处理: 若任一步骤失败，发送错误消息给客户端并清理会话。
+     *
+     * @param {WebSocket} ws  - WebSocket 连接实例
+     * @param {http.IncomingMessage} req - HTTP 升级请求
+     */
     async _onConnection(ws, req) {
         const sessionId = uuidv4();
         console.log(`[server] New connection: ${sessionId} (from ${req.socket.remoteAddress})`);
@@ -207,7 +291,7 @@ class WisonRBIServer {
         metrics.counter(SESSIONS_TOTAL);
         metrics.counter(WS_CONNECTIONS);
 
-        // 创建会话
+        // 创建会话 — 初始状态为活跃
         const session = new Session(sessionId);
         session.socket = ws;
         this._sessions.set(sessionId, session);
@@ -216,21 +300,22 @@ class WisonRBIServer {
         let cdpClient = null;
 
         try {
-            // 获取 Chromium 实例
+            // 获取 Chromium 实例 — 可能复用空闲实例或创建新实例
             const chromium = await this._chromiumPool.acquire(sessionId);
             session.chromium = chromium;
 
-            // 获取 CDP 客户端
+            // 获取 CDP 客户端 — InputProxy 的核心依赖
             cdpClient = chromium._cdpClient;
             if (!cdpClient) {
                 throw new Error('Chromium instance has no CDP client');
             }
 
-            // 创建输入代理
+            // 创建输入代理 — 将 CDP 客户端和 Session 绑定
             inputProxy = new InputProxy(cdpClient, session);
 
         } catch (err) {
             console.error(`[server] Failed to initialize session ${sessionId}:`, err.message);
+            // 发送结构化错误消息给客户端
             this._sendError(ws, 'SESSION_INIT_FAILED', err.message);
             session.close();
             this._sessions.delete(sessionId);
@@ -238,12 +323,14 @@ class WisonRBIServer {
         }
 
         // ── 消息处理 ──
+        // 客户端发送的 JSON 消息在此路由
         ws.on('message', async (data) => {
             try {
                 const msg = JSON.parse(data.toString());
                 await this._handleMessage(session, inputProxy, msg);
             } catch (err) {
                 // 非 JSON 消息（可能是二进制帧相关？）— 忽略
+                // 二进制帧不通过 message 事件传输（使用 WebSocket 二进制模式）
                 if (err instanceof SyntaxError) {
                     console.warn(`[server] Non-JSON message from ${sessionId}`);
                 } else {
@@ -255,10 +342,12 @@ class WisonRBIServer {
         // ── 连接关闭 ──
         ws.on('close', (code, reason) => {
             console.log(`[server] Connection closed: ${sessionId} (code=${code})`);
+            // 清理背压监控定时器
             clearInterval(backpressureInterval);
             session.close();
             this._sessions.delete(sessionId);
             metrics.decGauge(SESSIONS_ACTIVE);
+            // 释放 Chromium 实例回池
             this._chromiumPool.release(sessionId).catch(err => {
                 console.error(`[server] Error releasing chromium:`, err.message);
             });
@@ -270,7 +359,10 @@ class WisonRBIServer {
             metrics.counter(WS_ERRORS);
         });
 
-        // ── 背压监控 ──
+        // ── 背压监控 (§4 / §8) ──
+        // 每 5 秒检查一次发送缓冲区
+        // 若缓冲区超过高水位 (WS_HIGH_WATER_MARK = 1MB)，
+        //   触发背压告警指标并在日志中记录
         const backpressureInterval = setInterval(() => {
             if (session.closed) return;
             if (ws.bufferedAmount > WS_HIGH_WATER_MARK) {
@@ -284,9 +376,27 @@ class WisonRBIServer {
     }
 
     // ═══════════════════════════════════════════════════════════
-    // 消息路由
+    // 消息路由 (§4)
     // ═══════════════════════════════════════════════════════════
 
+    /**
+     * 客户端消息路由器 — 根据 type 字段分发到对应处理器。
+     *
+     * 支持的消息类型:
+     *   - 'ready':             客户端就绪，请求导航到指定 URL
+     *   - 'viewport':          客户端视口尺寸更新（resize 事件）
+     *   - 'io':                HID 输入事件（鼠标/键盘/滚轮）
+     *   - 'request_keyframe':  客户端请求关键帧（白名单连续拒绝 ≥3 帧, §8）
+     *   - 'version_error':     协议版本不匹配
+     *   - 'ping':              心跳保活
+     *
+     * 注意: msg.type 和 msg.event 都会被检查，
+     *   以兼容不同客户端版本的字段命名。
+     *
+     * @param {Session} session    - 当前会话
+     * @param {InputProxy} inputProxy - 输入代理实例
+     * @param {object} msg         - 客户端消息
+     */
     async _handleMessage(session, inputProxy, msg) {
         if (session.closed) return;
 
@@ -296,6 +406,7 @@ class WisonRBIServer {
                 break;
 
             case 'viewport':
+                // 客户端窗口尺寸变化 → 更新 CDP Emulation 域
                 await inputProxy.updateViewport(
                     msg.width,
                     msg.height,
@@ -304,18 +415,19 @@ class WisonRBIServer {
                 break;
 
             case 'io':
+                // 原始 HID 输入事件 → 坐标转换 + CDP 注入 (§7)
                 await inputProxy.handleIOEvent(msg);
                 break;
 
             case 'request_keyframe':
-                // 客户端请求关键帧（v1.6: 白名单连续拒绝≥3帧触发）
+                // 客户端请求关键帧（v1.6: 白名单连续拒绝 ≥3 帧触发, §8）
+                // 设置标志位，下一帧将标记 FLAG_IS_KEYFRAME
                 console.log(`[server] Keyframe requested by ${session.sessionId}`);
-                // 下一帧将标记为 keyframe
                 session._nextFrameIsKeyframe = true;
                 break;
 
             case 'version_error':
-                // 客户端不支持当前协议版本
+                // 客户端不支持当前协议版本 — 发送版本不匹配错误
                 console.warn(
                     `[server] Protocol version mismatch for ${session.sessionId}. ` +
                     `Server: ${PROTOCOL_VERSION}`
@@ -328,6 +440,7 @@ class WisonRBIServer {
                 break;
 
             case 'ping':
+                // 心跳: 立即回复 pong（保持 WebSocket 连接活跃）
                 if (session.socket && session.socket.readyState === 1) {
                     session.socket.send(JSON.stringify({ type: 'pong' }));
                 }
@@ -339,7 +452,24 @@ class WisonRBIServer {
     }
 
     // ═══════════════════════════════════════════════════════════
+    // 导航处理
+    // ═══════════════════════════════════════════════════════════
 
+    /**
+     * 处理客户端就绪消息 — 导航到指定 URL。
+     *
+     * URL 来源: msg.url 或 msg.data（兼容不同客户端版本）。
+     * 默认: 'about:blank'（空白页，不做任何外部请求）。
+     *
+     * 安全考量:
+     *   - URL 来自客户端，服务端直接传递给 Chromium
+     *   - 本模块不对 URL 做白名单/黑名单校验（该职责属于上层网关）
+     *   - Chromium 沙箱内执行，恶意 URL 无法突破沙箱
+     *
+     * @param {Session} session
+     * @param {InputProxy} inputProxy
+     * @param {object} msg - 客户端消息（可能包含 url 或 data 字段）
+     */
     async _handleReady(session, inputProxy, msg) {
         const url = msg.url || msg.data || 'about:blank';
         console.log(`[server] Session ${session.sessionId} navigating to: ${url}`);
@@ -353,26 +483,39 @@ class WisonRBIServer {
     }
 
     // ═══════════════════════════════════════════════════════════
-    // 帧发送 (Chromium → 客户端)
+    // 帧发送 (Chromium → 客户端) (§4 / §6)
     // ═══════════════════════════════════════════════════════════
 
     /**
      * 向客户端发送帧。
-     * 此方法由 Chromium 的 FrameAssembler 回调触发（通过 C++ 桥接）。
      *
-     * @param {Session} session
-     * @param {object} frameMeta - 帧元数据
-     * @param {Buffer} commandStream - 命令流
+     * 此方法由 Chromium 的 FrameAssembler 回调触发（通过 C++ 桥接）。
+     * 帧发送路径:
+     *   meta + commandStream → assembleFrame() → compressFrame() → ws.send()
+     *
+     * 背压处理 (§8):
+     *   若 WebSocket 发送缓冲区超过 WS_HIGH_WATER_MARK (1MB):
+     *     - 非关键帧: 丢弃（FRAMES_DROPPED 指标递增）
+     *     - 关键帧:   强制发送（保证客户端状态一致性）
+     *
+     * 副作用:
+     *   - 指标: FRAMES_SENT / FRAMES_DROPPED
+     *   - 帧历史: session.recordFrame() 记录元数据
+     *
+     * @param {Session} session          - 目标会话
+     * @param {object} frameMeta         - 帧元数据
+     * @param {Buffer} commandStream     - 命令流字节（已序列化的 PaintOp 列表）
      */
     async sendFrame(session, frameMeta, commandStream) {
         if (session.closed) return;
         const ws = session.socket;
+        // readyState === 1 = WebSocket.OPEN
         if (!ws || ws.readyState !== 1) return;
 
-        // 背压检测：如果缓冲区超过高水位，丢弃非关键帧
+        // 背压检测：如果缓冲区超过高水位，丢弃非关键帧 (§4 / §8)
         if (ws.bufferedAmount > WS_HIGH_WATER_MARK) {
             if (!frameMeta.isKeyframe) {
-                // 丢弃非关键帧
+                // 丢弃非关键帧 — 关键帧必须发送以保证客户端状态同步
                 metrics.counter(FRAMES_DROPPED);
                 console.warn(
                     `[server] Dropping non-keyframe ${frameMeta.frameId} ` +
@@ -383,17 +526,17 @@ class WisonRBIServer {
         }
 
         try {
-            // 组装帧
+            // 组装帧: Header (30B) + CommandStream + CRC32 (4B)
             const frame = assembleFrame(frameMeta, commandStream);
 
-            // gzip 压缩 (v1.6 三层防护)
+            // gzip 压缩: v1.6 三层 zip bomb 防护 (§6.4)
             const compressed = await compressFrame(frame);
 
-            // 发送二进制帧
+            // 发送二进制帧 — WebSocket binary mode
             ws.send(compressed, { binary: true });
             metrics.counter(FRAMES_SENT);
 
-            // 记录帧元数据到会话历史
+            // 记录帧元数据到会话历史 — 供输入坐标转换使用 (§7)
             session.recordFrame({
                 frameId: frameMeta.frameId,
                 timestampMs: frameMeta.timestampMs,
@@ -407,14 +550,27 @@ class WisonRBIServer {
 
         } catch (err) {
             console.error(`[server] Failed to send frame ${frameMeta.frameId}:`, err.message);
-            // 帧组装失败 — 不发送
+            // 帧组装失败 — 不发送，客户端将看到上一帧的画面
+            // 常见失败原因: 压缩炸弹检测、帧大小超限
         }
     }
 
     // ═══════════════════════════════════════════════════════════
-    // 错误消息
+    // 错误消息 (§8)
     // ═══════════════════════════════════════════════════════════
 
+    /**
+     * 向客户端发送结构化错误消息。
+     *
+     * 错误消息格式:
+     *   { type: 'error', code: string, message: string, timestamp: number }
+     *
+     * 在 WebSocket 非 OPEN 状态时静默失败（防止级联错误）。
+     *
+     * @param {WebSocket} ws - WebSocket 连接
+     * @param {string} code    - 错误码（如 'SESSION_INIT_FAILED', 'PROTOCOL_VERSION_MISMATCH'）
+     * @param {string} message - 人类可读错误描述
+     */
     _sendError(ws, code, message) {
         if (ws && ws.readyState === 1) {
             try {
@@ -425,7 +581,7 @@ class WisonRBIServer {
                     timestamp: Date.now(),
                 }));
             } catch (e) {
-                // 忽略发送失败
+                // 忽略发送失败 — 连接可能已断开
             }
         }
     }
@@ -435,6 +591,7 @@ class WisonRBIServer {
 // 入口
 // ═══════════════════════════════════════════════════════════════
 
+// 仅在直接执行时启动服务器（require 时不启动）
 if (require.main === module) {
     const port = parseInt(process.env.PORT || '3000', 10);
     const chromiumPath = process.env.CHROMIUM_PATH || 'chromium';

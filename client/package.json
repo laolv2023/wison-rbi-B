@@ -1,19 +1,40 @@
 {
+  "_comment": "============================================================================",
+  "_comment__file": "package.json — Wison-RBI 客户端（Chrome Extension）包配置",
+  "_comment__role": [
+    "声明客户端项目元信息、NPM 依赖和运行脚本",
+    "客户端作为 Chrome 扩展（MV3）运行，依赖 CanvasKit-WASM（Skia 渲染）和 Socket.IO 客户端",
+    "本文件主要用于 npm install 安装依赖，扩展本身由 Chrome 加载而非由 Node.js 运行"
+  ],
+  "_comment__security": [
+    "依赖锁定为固定大版本（^），定期审查安全公告",
+    "canvaskit-wasm 版本锁定在 0.39.x，跨大版本可能引入 API 变更",
+    "socket.io-client 锁定在 4.7.x，生产环境强制使用 wss:// 连接",
+    "Node.js 最低版本 18，确保安全补丁和 WASM 支持"
+  ],
   "name": "wison-rbi-client",
   "version": "1.6.0",
   "description": "Wison-RBI: Browser Isolation Client (Chrome Extension MV3)",
   "type": "module",
+  "_comment__scripts": "NPM 脚本：",
+  "_comment__scripts_build": "  build — 客户端无需编译构建，直接在 Chrome 中运行",
+  "_comment__scripts_lint": "  lint  — 使用 ESLint 检查所有 JS 文件代码质量",
   "scripts": {
     "build": "echo 'No build step required — client runs directly in Chrome'",
     "lint": "eslint *.js"
   },
+  "_comment__dependencies": "运行时依赖：",
+  "_comment__deps_canvaskit": "  canvaskit-wasm — Skia 图形库的 WebAssembly 移植，提供 2D 渲染 API",
+  "_comment__deps_socketio": "  socket.io-client — Socket.IO 客户端库，实现与服务器的 WebSocket 双向通信",
   "dependencies": {
     "canvaskit-wasm": "^0.39.1",
     "socket.io-client": "^4.7.4"
   },
+  "_comment__engines": "Node.js 版本要求：>= 18.0.0（用于 npm install，不用于运行扩展）",
   "engines": {
     "node": ">=18.0.0"
   },
+  "_comment__keywords": "项目关键词：用于 NPM 搜索和分类",
   "keywords": [
     "browser-isolation",
     "rbi",
@@ -22,6 +43,7 @@
     "mv3"
   ],
   "license": "MIT",
+  "_comment__repository": "Git 仓库地址",
   "repository": {
     "type": "git",
     "url": "https://github.com/laolv2023/wison-rbi"

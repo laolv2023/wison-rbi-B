@@ -1,5 +1,22 @@
 [
   {
+    "_comment": "============================================================================",
+    "_comment__file": "rules.json — Wison-RBI 声明式网络请求（DNR）静态规则",
+    "_comment__role": [
+      "拦截所有 HTTP/HTTPS 导航请求（main_frame + sub_frame）",
+      "将匹配的请求重定向到扩展内置的 RBI 沙箱页面（index.html）",
+      "原始 URL 作为查询参数 ?url=xxx 传递给沙箱页面"
+    ],
+    "_comment__security": [
+      "excludedInitiatorDomains: 排除扩展自页面发起的导航，防止重定向死循环",
+      "resourceTypes 限定为 main_frame 和 sub_frame，不拦截子资源（图片/CSS/JS/XHR）",
+      "仅匹配 http/https 协议（regexFilter: ^https?://），不影响 chrome:// 等内部页面",
+      "__extension_id__ 占位符由 Chrome 运行时自动替换为扩展的实际 ID",
+      "priority: 1 — 低于动态例外规则的 priority: 100，确保例外站点优先放行"
+    ],
+    "_comment__id": "规则 ID=1，属于静态规则 ID 区间 [1, 999]，与动态规则 [1000, 1999] 隔离",
+    "_comment__action": "redirect 动作：使用正则替换将匹配的 URL 重定向到扩展沙箱页面",
+    "_comment__regexSubstitution": "\\0 代表匹配到的完整 URL，经 encodeURIComponent 编码后作为 url 参数传递",
     "id": 1,
     "priority": 1,
     "action": {

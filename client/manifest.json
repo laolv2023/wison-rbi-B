@@ -1,26 +1,59 @@
 {
+  "_comment": "============================================================================",
+  "_comment__file": "manifest.json — Wison-RBI Chrome 扩展清单文件（Manifest V3）",
+  "_comment__role": [
+    "定义扩展的元信息、权限、后台脚本、CSP、Web可访问资源",
+    "声明 declarativeNetRequest 静态规则以拦截 HTTP 导航请求",
+    "配置 content_security_policy 限制脚本/对象/连接源"
+  ],
+  "_comment__security": [
+    "CSP: script-src 仅允许 'self' + 'wasm-unsafe-eval'，禁止外部脚本",
+    "CSP: object-src 仅允许 'self'，禁止嵌入 Flash/Java 等外部插件",
+    "CSP: connect-src 仅允许 wss://，确保所有通信加密",
+    "权限遵循最小化原则：declarativeNetRequest + storage + tabs",
+    "web_accessible_resources 白名单控制哪些文件可被网页访问",
+    "host_permissions 使用 <all_urls> 是必需的，因为需要拦截所有 HTTP 导航"
+  ],
   "manifest_version": 3,
   "name": "Wison-RBI",
   "version": "1.6.0",
   "description": "Compositor-layer browser isolation client",
   "author": "Wison-RBI Design Team",
   "homepage_url": "https://github.com/laolv2023/wison-rbi",
+  "_comment__permissions": "权限说明：",
+  "_comment__permissions_declarativeNetRequest": "  declarativeNetRequest — 声明式网络请求规则引擎，用于拦截/重定向 HTTP 请求",
+  "_comment__permissions_declarativeNetRequestWithHostAccess": "  declarativeNetRequestWithHostAccess — 允许动态规则匹配 <all_urls> 范围",
+  "_comment__permissions_storage": "  storage — 持久化用户配置（例外域名白名单）",
+  "_comment__permissions_tabs": "  tabs — 读取/修改标签页 URL（动态重定向兜底方案）",
   "permissions": [
     "declarativeNetRequest",
     "declarativeNetRequestWithHostAccess",
     "storage",
     "tabs"
   ],
+  "_comment__host_permissions": "host_permissions: 需要拦截所有 HTTP/HTTPS URL 的导航请求",
   "host_permissions": [
     "<all_urls>"
   ],
+  "_comment__background": "后台脚本：MV3 Service Worker（ES Module 模式）",
+  "_comment__background_details": "  - 负责拦截 HTTP 请求并重定向到 RBI 沙箱页面",
+  "_comment__background_details2": "  - Module Worker 支持顶层 await 和静态 import",
   "background": {
     "service_worker": "background.js",
     "type": "module"
   },
+  "_comment__csp": "内容安全策略（CSP）：限制扩展页面的资源加载能力",
+  "_comment__csp_script": "  script-src: 仅允许本扩展脚本 + WASM 执行（CanvasKit 需要 wasm-unsafe-eval）",
+  "_comment__csp_object": "  object-src: 禁止所有插件对象（Flash、Java 等），防止第三方代码执行",
+  "_comment__csp_connect": "  connect-src: 仅允许 WebSocket Secure（wss://），防止明文通信",
   "content_security_policy": {
     "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'; connect-src wss://*:*"
   },
+  "_comment__web_accessible_resources": "Web 可访问资源：白名单控制哪些扩展文件可被重定向后的页面引用",
+  "_comment__war_details": "  - index.html/index.js 等为应用核心模块",
+  "_comment__war_details2": "  - canvaskit-wasm: Skia WASM 渲染引擎",
+  "_comment__war_details3": "  - socket.io-client: WebSocket 通信客户端",
+  "_comment__war_details4": "  - matches: <all_urls> 允许从所有 URL 访问这些资源",
   "web_accessible_resources": [
     {
       "resources": [
@@ -37,6 +70,10 @@
       "matches": ["<all_urls>"]
     }
   ],
+  "_comment__dnr": "声明式网络请求规则：定义 HTTP 请求拦截逻辑",
+  "_comment__dnr_details": "  - rules.json 包含静态规则，在扩展安装时加载",
+  "_comment__dnr_details2": "  - 规则将导航请求重定向到扩展的 index.html 沙箱页面",
+  "_comment__dnr_details3": "  - enabled: true 表示扩展加载后立即生效",
   "declarative_net_request": {
     "rule_resources": [
       {
@@ -46,6 +83,10 @@
       }
     ]
   },
+  "_comment__icons": "扩展图标：三种尺寸分别用于不同场景",
+  "_comment__icons_16": "  16x16 — 扩展工具栏图标、chrome://extensions 列表",
+  "_comment__icons_48": "  48x48 — 扩展管理页面详情",
+  "_comment__icons_128": "  128x128 — Chrome Web Store 展示、安装确认对话框",
   "icons": {
     "16": "icons/icon16.png",
     "48": "icons/icon48.png",
