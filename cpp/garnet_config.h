@@ -55,6 +55,7 @@ constexpr uint8_t kProtocolVersion = 0x01;
 /// 每个 bit 独立含义，客户端通过位运算检查。
 constexpr uint8_t kFlagIsKeyframe  = 0x01;  ///< bit0: 全帧(keyframe) vs 增量帧
 constexpr uint8_t kFlagHasFontData = 0x02;  ///< bit1: 帧内包含 @font-face 二进制数据
+constexpr uint8_t kFlagHasDirtyRects = 0x04; ///< bit2: 帧头后跟随脏区域矩形列表 (Phase 4 R-tree)
 
 // ═══════════════════════════════════════════════════════════════
 // 帧级硬上限 — §8.4 安全边界 (v1.6 P0 S1)
@@ -188,6 +189,23 @@ constexpr int64_t kFrameHistoryMaxAgeMs = 1000;
 /// 安全理由: 即使时间未到（如 1000ms 内高频 1000+ 帧），
 /// 条目数也需硬上限。1000 帧 @60fps = ~16.7s 数据。
 constexpr size_t kFrameHistoryMaxEntries = 1000;
+
+// ═══════════════════════════════════════════════════════════════
+// R-tree 增量帧 (Phase 4 — §4.1.1 增量更新)
+//
+// 脏区域矩形格式: x(f32) + y(f32) + w(f32) + h(f32) = 16 字节/矩形
+// 存储位置: 帧头之后、CommandStream 之前（仅当 FLAG_HAS_DIRTY_RECTS 置位）
+// 布局: [count(2B uint16 LE)] [rect0(16B)] [rect1(16B)] ...
+// ═══════════════════════════════════════════════════════════════
+
+/// @brief R-tree 增量帧: 脏区域矩形条目大小（字节）。
+constexpr size_t kDirtyRectEntrySize = 16;  // x(f32) + y(f32) + w(f32) + h(f32)
+
+/// @brief R-tree 增量帧: 单帧最大脏区域矩形数。
+///
+/// 安全理由: 防止攻击者伪造超大 count 导致 OOM。
+/// 64 个矩形足以覆盖复杂页面变动（典型页面变动 <10 个矩形）。
+constexpr uint16_t kMaxDirtyRects = 64;
 
 /// @brief 白名单连续拒绝阈值: 3 帧 → 触发 request_keyframe。
 ///

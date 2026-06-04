@@ -185,6 +185,32 @@ export async function decompressWithProtection(compressed) {
 }
 
 // ═══════════════════════════════════════════════════════════════
+// ArrayBuffer 归一化
+//
+// Node.js Buffer.allocUnsafe 可能从共享池分配，导致 frame.buffer 的
+// ArrayBuffer 起始偏移非零。此辅助函数确保输入始终是正确对齐的 ArrayBuffer。
+// ═══════════════════════════════════════════════════════════════
+
+/**
+ * 将 TypedArray 或 ArrayBuffer 归一化为正确对齐的 ArrayBuffer。
+ * Node.js Buffer.allocUnsafe 可能回退到共享池分配，
+ * 此时 buf.buffer 对应的 ArrayBuffer 可能包含池中前置数据。
+ * 本函数检测该情况并在必要时切片。
+ *
+ * @param {ArrayBuffer|ArrayBufferView} buf - 帧缓冲区
+ * @returns {ArrayBuffer} 正确对齐、byteOffset=0 的 ArrayBuffer
+ */
+function normalizeArrayBuffer(buf) {
+    if (ArrayBuffer.isView(buf)) {
+        if (buf.byteOffset === 0 && buf.byteLength === buf.buffer.byteLength) {
+            return buf.buffer;
+        }
+        return buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
+    }
+    return buf;
+}
+
+// ═══════════════════════════════════════════════════════════════
 // 帧头解析
 //
 // 对应 §6.2 定义的二进制帧格式:
@@ -224,12 +250,14 @@ export async function decompressWithProtection(compressed) {
  * @throws {Error} 帧小于 FRAME_HEADER_SIZE (30B) 时抛出
  */
 export function parseFrameHeader(frameBuffer) {
+    frameBuffer = normalizeArrayBuffer(frameBuffer);
     const view = new DataView(frameBuffer);
     const { OFFSET_VERSION, OFFSET_FLAGS, OFFSET_FRAME_ID,
             OFFSET_TIMESTAMP_MS, OFFSET_SCROLL_X, OFFSET_SCROLL_Y,
             OFFSET_VIEWPORT_W, OFFSET_VIEWPORT_H,
             OFFSET_CANVAS_W, OFFSET_CANVAS_H,
-            FLAG_IS_KEYFRAME, FLAG_HAS_FONT_DATA } = PROTOCOL;
+            FLAG_IS_KEYFRAME, FLAG_HAS_FONT_DATA, FLAG_HAS_DIRTY_RECTS,
+            DIRTY_RECT_ENTRY_SIZE, MAX_DIRTY_RECTS } = PROTOCOL;
 
     // 边界检查: 帧至少包含帧头
     if (frameBuffer.byteLength < PROTOCOL.FRAME_HEADER_SIZE) {
@@ -249,11 +277,42 @@ export function parseFrameHeader(frameBuffer) {
     const canvasW  = view.getUint16(OFFSET_CANVAS_W, true);
     const canvasH  = view.getUint16(OFFSET_CANVAS_H, true);
 
+    const hasDirtyRects = !!(flags & FLAG_HAS_DIRTY_RECTS);
+    let dirtyRects = [];
+
+    // Phase 4: 解析脏区域矩形列表
+    let dirtyRectsEndOffset = PROTOCOL.FRAME_HEADER_SIZE;
+    if (hasDirtyRects) {
+        const drOffset = PROTOCOL.FRAME_HEADER_SIZE;
+        if (frameBuffer.byteLength >= drOffset + 2) {
+            const count = view.getUint16(drOffset, true);
+            if (count <= MAX_DIRTY_RECTS) {
+                const drSize = 2 + count * DIRTY_RECT_ENTRY_SIZE;
+                if (frameBuffer.byteLength >= drOffset + drSize) {
+                    let pos = drOffset + 2;
+                    for (let i = 0; i < count; i++) {
+                        dirtyRects.push({
+                            x: view.getFloat32(pos, true),
+                            y: view.getFloat32(pos + 4, true),
+                            w: view.getFloat32(pos + 8, true),
+                            h: view.getFloat32(pos + 12, true),
+                        });
+                        pos += DIRTY_RECT_ENTRY_SIZE;
+                    }
+                    dirtyRectsEndOffset = drOffset + drSize;
+                }
+            }
+        }
+    }
+
     return {
         version,
         flags,
         isKeyframe: !!(flags & FLAG_IS_KEYFRAME),
         hasFontData: !!(flags & FLAG_HAS_FONT_DATA),
+        hasDirtyRects,
+        dirtyRects,
+        dirtyRectsEndOffset,  // Phase 4: CommandStream 的起始偏移
         frameId,
         timestampMs,
         scrollX,
@@ -280,6 +339,7 @@ export function parseFrameHeader(frameBuffer) {
  * @returns {boolean} CRC 是否匹配。false 时调用方应丢弃该帧
  */
 export function validateFrameCRC(frameBuffer) {
+    frameBuffer = normalizeArrayBuffer(frameBuffer);
     const { FRAME_HEADER_SIZE, FRAME_TRAILER_SIZE } = PROTOCOL;
 
     // 帧至少需要 header + trailer
@@ -308,12 +368,16 @@ export function validateFrameCRC(frameBuffer) {
  * 命令流 = frameBuffer[30 .. N-5]
  *
  * @param {ArrayBuffer} frameBuffer - 完整帧
+ * @param {number} [cmdStartOffset] - Phase 4: 命令流起始偏移 (默认 FRAME_HEADER_SIZE)
  * @returns {ArrayBuffer} 命令流字节 (零拷贝 slice)
  */
-export function extractCommandStream(frameBuffer) {
+export function extractCommandStream(frameBuffer, cmdStartOffset) {
+    frameBuffer = normalizeArrayBuffer(frameBuffer);
     const { FRAME_HEADER_SIZE, FRAME_TRAILER_SIZE } = PROTOCOL;
-    const cmdLen = frameBuffer.byteLength - FRAME_HEADER_SIZE - FRAME_TRAILER_SIZE;
-    return frameBuffer.slice(FRAME_HEADER_SIZE, FRAME_HEADER_SIZE + cmdLen);
+    const start = cmdStartOffset || FRAME_HEADER_SIZE;
+    const cmdLen = frameBuffer.byteLength - start - FRAME_TRAILER_SIZE;
+    if (cmdLen <= 0) return new ArrayBuffer(0);
+    return frameBuffer.slice(start, start + cmdLen);
 }
 
 // ═══════════════════════════════════════════════════════════════

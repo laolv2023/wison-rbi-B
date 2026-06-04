@@ -96,6 +96,20 @@ const PROTOCOL = Object.freeze({
      * 参考: §8.4 P1 S4 字体内联校验
      */
     FLAG_HAS_FONT_DATA: 0x02,
+    /**
+     * 标志位: 此帧是否包含脏区域矩形列表 (Phase 4 R-tree 增量帧)。
+     * 设置时，帧头后的 2 字节为 dirty_rects_count，后跟 count × 16 字节脏矩形。
+     * 脏矩形格式: x(f32 LE) + y(f32 LE) + w(f32 LE) + h(f32 LE)。
+     * 客户端收到增量帧时应仅重绘脏区域以提升性能（仍校验全部命令）。
+     * 参考: §4.1.1 R-tree 增量更新, §6.2 标志位
+     */
+    FLAG_HAS_DIRTY_RECTS: 0x04,
+
+    // ── R-tree 增量帧常量 (§4.1.1) ──
+    /** 脏区域矩形条目大小: 4 个 f32 = 16 字节 */
+    DIRTY_RECT_ENTRY_SIZE: 16,
+    /** 单帧最大脏区域矩形数, 安全上限防 OOM */
+    MAX_DIRTY_RECTS: 64,
 
     // ── 命令常量 ──
     /**

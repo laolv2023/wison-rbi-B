@@ -141,7 +141,7 @@ function serializeFrameHeader(meta) {
     offset += 1;
 
     // Byte 1: flags — 位掩码组合
-    let flags = 0;
+    let flags = (meta.flags || 0);  // Phase 4: 允许外部设置 flags (如 FLAG_HAS_DIRTY_RECTS)
     if (meta.isKeyframe) flags |= FLAG_IS_KEYFRAME;   // bit 0
     if (meta.hasFontData) flags |= FLAG_HAS_FONT_DATA; // bit 1
     buf.writeUInt8(flags, offset);
@@ -220,6 +220,7 @@ function deserializeFrameHeader(buf) {
         flags,
         isKeyframe: !!(flags & FLAG_IS_KEYFRAME),   // 位提取
         hasFontData: !!(flags & FLAG_HAS_FONT_DATA),
+        hasDirtyRects: !!(flags & FLAG_HAS_DIRTY_RECTS),  // Phase 4
         frameId,
         timestampMs,
         scrollX,
@@ -238,27 +239,44 @@ function deserializeFrameHeader(buf) {
 /**
  * 组装完整帧（未压缩版本）。
  *
- * 帧结构:
+ * 帧结构 (基础):
  *   [30 bytes Header] [N bytes CommandStream] [4 bytes CRC32]
  *
- * CRC32 覆盖范围: Header + CommandStream（不含 Trailer 自身）。
+ * 帧结构 (含脏区域, Phase 4):
+ *   [30 bytes Header] [DirtyRects variable] [N bytes CommandStream] [4 bytes CRC32]
+ *   其中 DirtyRects = [count(2B uint16 LE)] [rect0(16B)] [rect1(16B)] ...
+ *
+ * CRC32 覆盖范围: Header + DirtyRects(若有) + CommandStream（不含 Trailer 自身）。
  * 客户端验证: 收到帧后重新计算 CRC32，与 Trailer 对比，不匹配则丢弃。
  *
  * 安全检查:
  *   - 总大小 ≤ MAX_BYTES_PER_FRAME (64MB): 超出直接抛错，防止内存炸弹
  *
  * @param {object} meta - 帧元数据 (同 serializeFrameHeader 参数)
+ *        meta.dirtyRects — 可选, 脏区域矩形数组 (Phase 4 R-tree)
  * @param {Buffer} commandStream - 命令流字节（可为空 Buffer 但不可为 null）
- * @returns {Buffer} 完整未压缩帧 (Header + CommandStream + CRC32)
+ * @returns {Buffer} 完整未压缩帧 (Header + [DirtyRects] + CommandStream + CRC32)
  * @throws {Error} 若总大小超过 MAX_BYTES_PER_FRAME
  */
 function assembleFrame(meta, commandStream) {
+    const { FLAG_HAS_DIRTY_RECTS: DIRTY_FLAG } = require('./config');
+
+    // 处理脏区域 (Phase 4 R-tree 增量帧)
+    let dirtyRectsBuf = null;
+    if (meta.dirtyRects && meta.dirtyRects.length > 0) {
+        dirtyRectsBuf = serializeDirtyRects(meta.dirtyRects);
+        // 自动设置标志位
+        if (!meta.flags) meta.flags = 0;
+        meta.flags |= DIRTY_FLAG;
+    }
+
     const header = serializeFrameHeader(meta);
 
     const cmdLen = commandStream ? commandStream.length : 0;
+    const dirtyLen = dirtyRectsBuf ? dirtyRectsBuf.length : 0;
 
     // 大小检查 — 防御性编程: 在分配 Buffer 前验证
-    const totalSize = FRAME_HEADER_SIZE + cmdLen + FRAME_TRAILER_SIZE;
+    const totalSize = FRAME_HEADER_SIZE + dirtyLen + cmdLen + FRAME_TRAILER_SIZE;
     if (totalSize > MAX_BYTES_PER_FRAME) {
         throw new Error(
             `Frame total size ${totalSize} exceeds MAX_BYTES_PER_FRAME (${MAX_BYTES_PER_FRAME})`
@@ -268,20 +286,30 @@ function assembleFrame(meta, commandStream) {
     // 单次分配: 避免多次 Buffer.concat 导致的内存碎片
     const frame = Buffer.allocUnsafe(totalSize);
 
+    let cursor = 0;
     // 拷贝 Header
-    header.copy(frame, 0);
+    header.copy(frame, cursor);
+    cursor += FRAME_HEADER_SIZE;
+
+    // 拷贝 DirtyRects (若有, Phase 4)
+    if (dirtyRectsBuf) {
+        dirtyRectsBuf.copy(frame, cursor);
+        cursor += dirtyLen;
+    }
 
     // 拷贝 CommandStream（可能为空）
     if (cmdLen > 0) {
-        commandStream.copy(frame, FRAME_HEADER_SIZE);
+        commandStream.copy(frame, cursor);
+        cursor += cmdLen;
     }
 
-    // 计算 CRC32: 覆盖 Header (0..29) + CommandStream (30..30+cmdLen-1)
-    const crcData = frame.subarray(0, FRAME_HEADER_SIZE + cmdLen);
+    // 计算 CRC32: 覆盖 Header + DirtyRects(若有) + CommandStream
+    // (CRC 应覆盖除 Trailer 外的全部帧数据, Phase 4 扩展)
+    const crcData = frame.subarray(0, cursor);
     const crc = computeCRC32(crcData);
 
     // 写入 CRC32 到帧尾 (uint32 LE)
-    frame.writeUInt32LE(crc, FRAME_HEADER_SIZE + cmdLen);
+    frame.writeUInt32LE(crc, cursor);
 
     return frame;
 }
@@ -458,6 +486,152 @@ class ImageHashRegistry {
 }
 
 // ═══════════════════════════════════════════════════════════════
+// R-tree 增量帧: 脏区域计算与序列化 (Phase 4 — §4.1.1)
+//
+// 原理: 比较相邻两帧的图层边界矩形，识别发生变化的区域。
+// 仅传输脏区域内的命令（实际命令过滤在 C++ LayerRecorder 完成），
+// 此处负责脏区域的序列化和帧组装时的标注。
+//
+// 格式: [count(2B uint16 LE)] [rect0(16B)] [rect1(16B)] ...
+//   每个 rect: x(f32 LE) + y(f32 LE) + w(f32 LE) + h(f32 LE)
+//
+// 安全: count 上限 MAX_DIRTY_RECTS (64)，防止伪造超大计数
+// ═══════════════════════════════════════════════════════════════
+
+/**
+ * 比较前后两帧的图层边界矩形容器，计算脏区域矩形列表。
+ *
+ * 算法: 贪心合并 — 对每个变化的图层，将其边界矩形与已有脏区域合并。
+ * 若合并后的总面积 ≤ 原面积之和，则合并（减少矩形数，降低传输开销）。
+ * 否则保留为独立矩形。
+ *
+ * @param {Array<{x:number,y:number,w:number,h:number}>} prevBounds — 上一帧图层边界
+ * @param {Array<{x:number,y:number,w:number,h:number}>} currBounds — 当前帧图层边界
+ * @returns {Array<{x:number,y:number,w:number,h:number}>} 脏区域列表
+ */
+function computeDirtyRects(prevBounds, currBounds) {
+    const MAX = require('./config').MAX_DIRTY_RECTS;
+
+    // 简化为: 收集当前帧所有图层边界（因为 Node.js 层无法访问真正的 R-tree）
+    // 实际 C++ 层会通过 DisplayItemList::rtree() 精确查询脏区域。
+    // 此处提供一个实用的近似实现。
+
+    if (!prevBounds || prevBounds.length === 0) {
+        // 首帧 → 整个画布都是脏的
+        return [{ x: 0, y: 0, w: 65535, h: 65535 }];
+    }
+
+    const dirty = [];
+
+    for (const curr of currBounds) {
+        // 查找上一帧中是否有重叠的图层
+        const hasOverlap = prevBounds.some(prev =>
+            rectsOverlap(prev, curr) && rectSimilar(prev, curr, 0.01)
+        );
+
+        if (!hasOverlap) {
+            // 新增或变化的图层 → 标记为脏区域
+            dirty.push({ ...curr });
+        }
+    }
+
+    // 贪心合并: 减少矩形数量
+    const merged = greedyMerge(dirty, MAX);
+
+    return merged.length > 0 ? merged : [{ x: 0, y: 0, w: 1, h: 1 }];
+}
+
+/** 检查两个矩形是否重叠 */
+function rectsOverlap(a, b) {
+    return !(a.x + a.w <= b.x || b.x + b.w <= a.x ||
+             a.y + a.h <= b.y || b.y + b.h <= a.y);
+}
+
+/** 检查两个矩形是否相似（面积差 < threshold） */
+function rectSimilar(a, b, threshold) {
+    const areaA = a.w * a.h;
+    const areaB = b.w * b.h;
+    if (areaA === 0 && areaB === 0) return true;
+    return Math.abs(areaA - areaB) / Math.max(areaA, areaB) < threshold;
+}
+
+/** 贪心合并矩形: 如果合并后面积 ≤ 原面积之和，则合并 */
+function greedyMerge(rects, maxCount) {
+    if (rects.length <= maxCount) return rects;
+
+    const result = [...rects];
+    while (result.length > maxCount) {
+        let bestI = -1, bestJ = -1;
+        let bestSaving = 0;
+
+        for (let i = 0; i < result.length; i++) {
+            for (let j = i + 1; j < result.length; j++) {
+                const unionArea = unionRect(result[i], result[j]);
+                const sumArea = result[i].w * result[i].h + result[j].w * result[j].h;
+                const saving = sumArea - unionArea;  // 正数 = 合并更紧凑
+                if (saving > bestSaving) {
+                    bestSaving = saving;
+                    bestI = i; bestJ = j;
+                }
+            }
+        }
+
+        if (bestI < 0) break;  // 无法再合并
+
+        // 合并 bestI 和 bestJ
+        result[bestI] = unionRectObj(result[bestI], result[bestJ]);
+        result.splice(bestJ, 1);
+    }
+
+    return result;
+}
+
+/** 计算两个矩形的包围盒面积 */
+function unionRect(a, b) {
+    const u = unionRectObj(a, b);
+    return u.w * u.h;
+}
+
+/** 计算两个矩形的包围盒 */
+function unionRectObj(a, b) {
+    const x = Math.min(a.x, b.x);
+    const y = Math.min(a.y, b.y);
+    return {
+        x, y,
+        w: Math.max(a.x + a.w, b.x + b.w) - x,
+        h: Math.max(a.y + a.h, b.y + b.h) - y,
+    };
+}
+
+/**
+ * 序列化脏区域矩形列表为二进制 Buffer。
+ *
+ * 格式: [count(2B uint16 LE)] [rect0(16B)] [rect1(16B)] ...
+ *   每个 rect: x(f32 LE) + y(f32 LE) + w(f32 LE) + h(f32 LE)
+ *
+ * @param {Array<{x:number,y:number,w:number,h:number}>} dirtyRects
+ * @returns {Buffer}
+ */
+function serializeDirtyRects(dirtyRects) {
+    const { MAX_DIRTY_RECTS, DIRTY_RECT_ENTRY_SIZE } = require('./config');
+    const count = Math.min(dirtyRects.length, MAX_DIRTY_RECTS);
+    const buf = Buffer.allocUnsafe(2 + count * DIRTY_RECT_ENTRY_SIZE);
+
+    buf.writeUInt16LE(count, 0);
+    let offset = 2;
+    for (let i = 0; i < count; i++) {
+        const r = dirtyRects[i];
+        buf.writeFloatLE(r.x, offset);
+        buf.writeFloatLE(r.y, offset + 4);
+        buf.writeFloatLE(r.w, offset + 8);
+        buf.writeFloatLE(r.h, offset + 12);
+        offset += DIRTY_RECT_ENTRY_SIZE;
+    }
+
+    return buf;
+}
+
+// ═══════════════════════════════════════════════════════════════
 // 导出
 // ═══════════════════════════════════════════════════════════════
 
@@ -468,4 +642,6 @@ module.exports = {
     compressFrame,
     computeCRC32,
     ImageHashRegistry,
+    computeDirtyRects,
+    serializeDirtyRects,
 };

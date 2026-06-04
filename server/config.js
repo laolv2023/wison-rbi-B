@@ -113,6 +113,11 @@ module.exports = Object.freeze({
     // ── 标志位 (§6.1) ──
     FLAG_IS_KEYFRAME: 0x01,    // 帧头 flags bit 0: 是否为关键帧
     FLAG_HAS_FONT_DATA: 0x02,  // 帧头 flags bit 1: 是否含字体数据
+    FLAG_HAS_DIRTY_RECTS: 0x04, // 帧头 flags bit 2: 是否含脏区域矩形 (Phase 4)
+
+    // ── R-tree 增量帧 (§4.1.1) ──
+    DIRTY_RECT_ENTRY_SIZE: 16,  // x(f32)+y(f32)+w(f32)+h(f32)
+    MAX_DIRTY_RECTS: 64,        // 单帧最大脏区域矩形数
 
     // ── 字体 Magic 白名单 (§S4, v1.6 P1) ──
     // 仅允许 SFNT 系列和 WOFF2 格式。WOFF v1 (0x774F4646) 明确拒绝。

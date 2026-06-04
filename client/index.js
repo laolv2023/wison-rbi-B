@@ -427,7 +427,10 @@ import {
             // ── Step 6: 命令流提取 + CommandValidator 白名单校验 ──
             // 这是安全不变量 1 的执行点 (§2.2)。
             // 所有命令在此通过 9 层校验后才允许进入 CanvasKit 渲染。
-            const commandStream = extractCommandStream(frameBuffer);
+            // Phase 4: 若有脏区域，从脏区域末尾开始提取命令流
+            const commandStream = extractCommandStream(
+                frameBuffer, header.dirtyRectsEndOffset
+            );
             let validation;
             try {
                 validation = validator.validate(commandStream);
@@ -494,7 +497,7 @@ import {
             // ── Step 11: 调度渲染 (如果尚未调度) ──
             if (!renderScheduled) {
                 renderScheduled = true;
-                await renderFrame(commandStream, header.isKeyframe);
+                await renderFrame(commandStream, header.isKeyframe, header.dirtyRects);
             }
 
             auditLog(LOG_LEVELS.DEBUG, 'frame_received', {
@@ -535,14 +538,18 @@ import {
     /**
      * 将命令流重放到 CanvasKit SkCanvas。
      *
+     * Phase 4 R-tree 增量帧: 若提供了 dirtyRects，每个脏区域独立渲染一遍命令流，
+     * 使用 clipRect 限制绘制范围。这利用了 CanvasKit 的 GPU 裁剪实现增量更新。
+     * 对于非增量帧（dirtyRects 为空），直接全帧渲染。
+     *
      * @param {ArrayBuffer} commandStream - 已校验的命令流 (§6.2)
      * @param {boolean} isKeyframe - 是否为关键帧 (决定是否清空画布)
+     * @param {Array<{x:number,y:number,w:number,h:number}>} [dirtyRects] - 脏区域 (Phase 4)
      * @returns {Promise<void>}
      */
-    async function renderFrame(commandStream, isKeyframe) {
+    async function renderFrame(commandStream, isKeyframe, dirtyRects) {
         try {
             const view = new DataView(commandStream);
-            let offset = 0;
             const OP = PROTOCOL.OPCODE;
 
             // 仅关键帧清空画布 (透明背景)；增量帧在已有内容上叠加
@@ -550,28 +557,22 @@ import {
                 skCanvas.clear(canvasKit.TRANSPARENT);
             }
 
-            while (offset < commandStream.byteLength) {
-                if (offset + PROTOCOL.COMMAND_HEADER_SIZE > commandStream.byteLength) break;
+            // Phase 4: 如果有脏区域，使用 clipRect 限制渲染范围
+            const useDirtyRects = dirtyRects && dirtyRects.length > 0 && !isKeyframe;
 
-                const opcode = view.getUint8(offset);
-                const payLen = (view.getUint8(offset + 1) |
-                               (view.getUint8(offset + 2) << 8) |
-                               (view.getUint8(offset + 3) << 16));
-
-                // 命令已在 validator 中校验过，此处仅执行
-                const payload = new DataView(
-                    commandStream,
-                    offset + PROTOCOL.COMMAND_HEADER_SIZE,
-                    payLen
-                );
-
-                dispatchOpcode(opcode, payload, payLen);
-
-                offset += PROTOCOL.COMMAND_HEADER_SIZE + payLen;
-
-                // 4 字节对齐
-                const remainder = offset % 4;
-                if (remainder !== 0) offset += (4 - remainder);
+            if (useDirtyRects) {
+                // 对每个脏区域独立重放命令流（裁剪到脏矩形范围内）
+                for (const dr of dirtyRects) {
+                    skCanvas.save();
+                    skCanvas.clipRect(
+                        canvasKit.XYWHRect(dr.x, dr.y, dr.w, dr.h),
+                        canvasKit.ClipOp.Intersect, true
+                    );
+                    replayCommands(view, OP, commandStream);
+                    skCanvas.restore();
+                }
+            } else {
+                replayCommands(view, OP, commandStream);
             }
 
             // Phase 2 侧信道防御: flush 前注入 ±1ms 随机抖动
@@ -587,6 +588,43 @@ import {
         } finally {
             renderScheduled = false;
             pendingFrameId = null;
+        }
+    }
+
+    /**
+     * 重放命令流到 SkCanvas (Phase 4 提取, 支持脏区域裁剪)。
+     *
+     * 从原始内联循环提取为独立函数，使 renderFrame 可以：
+     *   - 全帧渲染: 调用 replayCommands 一次
+     *   - 增量渲染: 对每个脏区域调用 replayCommands（配合 save/clipRect/restore）
+     *
+     * @param {DataView} view - 命令流 DataView
+     * @param {object} OP - PROTOCOL.OPCODE 别名
+     * @param {ArrayBuffer} commandStream - 原始命令流 (用于 payload 切片)
+     */
+    function replayCommands(view, OP, commandStream) {
+        let offset = 0;
+        while (offset < commandStream.byteLength) {
+            if (offset + PROTOCOL.COMMAND_HEADER_SIZE > commandStream.byteLength) break;
+
+            const opcode = view.getUint8(offset);
+            const payLen = (view.getUint8(offset + 1) |
+                           (view.getUint8(offset + 2) << 8) |
+                           (view.getUint8(offset + 3) << 16));
+
+            const payload = new DataView(
+                commandStream,
+                offset + PROTOCOL.COMMAND_HEADER_SIZE,
+                payLen
+            );
+
+            dispatchOpcode(opcode, payload, payLen);
+
+            offset += PROTOCOL.COMMAND_HEADER_SIZE + payLen;
+
+            // 4 字节对齐
+            const remainder = offset % 4;
+            if (remainder !== 0) offset += (4 - remainder);
         }
     }
 
