@@ -141,6 +141,9 @@ void LayerRecorder::recordPictureLayer(
     if (paint_ops_data != nullptr && paint_ops_size > 0) {
         snap.paint_ops.assign(paint_ops_data, paint_ops_data + paint_ops_size);
     }
+    else if (paint_ops_size > 0 && paint_ops_data == nullptr) {
+        throw std::invalid_argument("recordPictureLayer: paint_ops_size>0 with null data");
+    }
 
     layers_.push_back(std::move(snap));
 }
@@ -329,6 +332,9 @@ FrameBuffer FrameAssembler::assembleFrame(
     auto canvas = canvas_factory_(static_cast<int>(canvas_w),
                                   static_cast<int>(canvas_h),
                                   image_mode);
+    if (!canvas) {
+        throw std::runtime_error("FrameAssembler: canvas factory returned null");
+    }
 
     // ── 步骤 2: 按 z-order 遍历图层，重放到 RecordingCanvas ──
     //
@@ -337,142 +343,153 @@ FrameBuffer FrameAssembler::assembleFrame(
     // draw* → restore。
     for (const auto& snap : layers) {
 
+        if (snap.bounds.isEmpty() || snap.visible_rect.isEmpty()) continue;
+
         canvas->save();
+        try {
 
-        // 应用图层的累积变换矩阵
-        canvas->concat(snap.transform);
+                // 应用图层的累积变换矩阵
+            canvas->concat(snap.transform);
 
-        // 设置可见区域裁剪（R-tree 裁剪优化）
-        // 使用 kIntersect 将绘制限制在 visible_rect 内
-        canvas->clipRect(snap.visible_rect, SkClipOp::kIntersect, false);
+            // 设置可见区域裁剪（R-tree 裁剪优化）
+            // 使用 kIntersect 将绘制限制在 visible_rect 内
+            canvas->clipRect(snap.visible_rect, SkClipOp::kIntersect, false);
 
-        // 根据图层类型执行不同的绘制逻辑
-        switch (snap.type) {
+            // 根据图层类型执行不同的绘制逻辑
+            switch (snap.type) {
 
-        case LayerSnapshot::Type::kPicture: {
-            // PictureLayer: PaintOp 重放
-            //
-            // ═══════════════════════════════════════════════════════
-            // [Phase A 集成点 — Chromium DisplayItemList → RecordingCanvas 桥接]
-            //
-            // 当前 PaintOp 数据以原始 Chromium cc::PaintOp 格式存储在
-            // snap.paint_ops 中。该格式是 Chromium 内部序列化格式，
-            // 无法直接写入 CommandBuffer（CommandBuffer 使用 Wison-RBI
-            // 自有 Opcode 协议）。
-            //
-            // 完整实现需要运行在 Chromium Compositor 线程中，通过以下
-            // 方式之一重放 PaintOp:
-            //
-            //   方案 A: 使用 cc::PaintOpReader 反序列化 PaintOpBuffer，
-            //           然后逐一转换为 RecordingCanvas 调用。
-            //           → 优点: 协议无关，客户端无需处理 Chromium 格式
-            //           → 缺点: 需要完整映射所有 PaintOp 类型
-            //
-            //   方案 B: 在 DisplayItemList::Finalize() 之后直接调用
-            //           DisplayItemList::Raster() 传入 RecordingCanvas。
-            //           → 优点: 自动调用所有 onDraw* 虚函数
-            //           → 缺点: 必须在 Chromium 线程中执行
-            //
-            // 当前 MVP 策略: 若 paint_ops 非空，记录存在性但不重放。
-            // 图层变换和裁剪已通过 save/concat/clipRect 正确设置，
-            // 仅缺少实际绘制内容。
-            //
-            // v1.6 备注:
-            //   - DisplayItemList::paint_op_buffer() 在 M143 中可能
-            //     不是公开 API，需要通过 Finalize() 间接获取数据。
-            //   - 实际集成时调用方应传入已序列化的 PaintOp 缓冲区。
-            // ═══════════════════════════════════════════════════════
-
-            if (!snap.paint_ops.empty()) {
-                // PaintOp 数据存在但无法在此上下文重放。
-                // Phase A 集成时将替换为实际的 PaintOp 重放逻辑。
+            case LayerSnapshot::Type::kPicture: {
+                // PictureLayer: PaintOp 重放
                 //
-                // 当前 emit kNoop (0x7F) 标记以保留图层占位。
-                // 客户端解析器将收到 save/concat/clipRect/noop/restore。
-                // TODO(Phase A): 替换为 DisplayItemList → RecordingCanvas 重放桥接。
-                (void)snap.paint_ops;  // 数据已保留在 snap 中，供 Phase A 使用
-            }
-            break;
-        }
+                // ═══════════════════════════════════════════════════════
+                // [Phase A 集成点 — Chromium DisplayItemList → RecordingCanvas 桥接]
+                //
+                // 当前 PaintOp 数据以原始 Chromium cc::PaintOp 格式存储在
+                // snap.paint_ops 中。该格式是 Chromium 内部序列化格式，
+                // 无法直接写入 CommandBuffer（CommandBuffer 使用 Wison-RBI
+                // 自有 Opcode 协议）。
+                //
+                // 完整实现需要运行在 Chromium Compositor 线程中，通过以下
+                // 方式之一重放 PaintOp:
+                //
+                //   方案 A: 使用 cc::PaintOpReader 反序列化 PaintOpBuffer，
+                //           然后逐一转换为 RecordingCanvas 调用。
+                //           → 优点: 协议无关，客户端无需处理 Chromium 格式
+                //           → 缺点: 需要完整映射所有 PaintOp 类型
+                //
+                //   方案 B: 在 DisplayItemList::Finalize() 之后直接调用
+                //           DisplayItemList::Raster() 传入 RecordingCanvas。
+                //           → 优点: 自动调用所有 onDraw* 虚函数
+                //           → 缺点: 必须在 Chromium 线程中执行
+                //
+                // 当前 MVP 策略: 若 paint_ops 非空，记录存在性但不重放。
+                // 图层变换和裁剪已通过 save/concat/clipRect 正确设置，
+                // 仅缺少实际绘制内容。
+                //
+                // v1.6 备注:
+                //   - DisplayItemList::paint_op_buffer() 在 M143 中可能
+                //     不是公开 API，需要通过 Finalize() 间接获取数据。
+                //   - 实际集成时调用方应传入已序列化的 PaintOp 缓冲区。
+                // ═══════════════════════════════════════════════════════
 
-        case LayerSnapshot::Type::kSolidColor: {
-            // SolidColorLayer: 纯色填充 (§4.1.1 v1.6 P0 A1)
-            //
-            // 使用 drawColor 填充整个裁剪区域。
-            // SkBlendMode::kSrc 确保完全覆盖（忽略目标像素），
-            // 等效于 Chromium 中 SolidColorLayer 的 Overdraw 行为。
-            canvas->drawColor(snap.solid_color, SkBlendMode::kSrc);
-            break;
-        }
-
-        case LayerSnapshot::Type::kScrollbar: {
-            // ScrollbarLayer: 滚动条绘制 (§4.1.1 v1.6 P0 A1)
-            //
-            // 根据 scrollbar_vertical 和 scrollbar_position / thumb_size
-            // 计算滑块矩形并绘制。
-            //
-            // 绘制策略:
-            //   1. 先绘制轨道背景 (track rect = bounds, 浅灰色)
-            //   2. 再绘制滑块 (thumb rect, 深灰色圆角矩形)
-            //
-            // scrollbar_position: 滑块起始位置比例 (0.0 ~ 1.0)
-            // scrollbar_thumb_size: 滑块大小比例 (0.0 ~ 1.0)
-
-            const SkRect& track = snap.bounds;
-            float thumb_pos   = snap.scrollbar_position;
-            float thumb_ratio = snap.scrollbar_thumb_size;
-
-            // 钳制参数到合法范围
-            if (thumb_pos < 0.0f) thumb_pos = 0.0f;
-            if (thumb_pos > 1.0f) thumb_pos = 1.0f;
-            if (thumb_ratio < 0.0f) thumb_ratio = 0.0f;
-            if (thumb_ratio > 1.0f) thumb_ratio = 1.0f;
-
-            // ── 轨道背景 ──
-            SkPaint track_paint;
-            track_paint.setColor(SkColorSetARGB(60, 0, 0, 0));   // 半透明深灰
-            track_paint.setStyle(SkPaint::kFill_Style);
-            canvas->drawRect(track, track_paint);
-
-            // ── 滑块 ──
-            SkRect thumb;
-            if (snap.scrollbar_vertical) {
-                // 垂直滚动条: 滑块沿 Y 轴移动
-                float track_height = track.height();
-                float thumb_height = track_height * thumb_ratio;
-                float thumb_y      = track.fTop + (track_height - thumb_height) * thumb_pos;
-                thumb = SkRect::MakeXYWH(track.fLeft, thumb_y,
-                                         track.width(), thumb_height);
-            } else {
-                // 水平滚动条: 滑块沿 X 轴移动
-                float track_width  = track.width();
-                float thumb_width  = track_width * thumb_ratio;
-                float thumb_x      = track.fLeft + (track_width - thumb_width) * thumb_pos;
-                thumb = SkRect::MakeXYWH(thumb_x, track.fTop,
-                                         thumb_width, track.height());
+                if (!snap.paint_ops.empty()) {
+                    // PaintOp 数据存在但无法在此上下文重放。
+                    // Phase A 集成时将替换为实际的 PaintOp 重放逻辑。
+                    //
+                    // 当前 emit kNoop (0x7F) 标记以保留图层占位。
+                    // 客户端解析器将收到 save/concat/clipRect/noop/restore。
+                    // TODO(Phase A): 替换为 DisplayItemList → RecordingCanvas 重放桥接。
+                    (void)snap.paint_ops;  // 数据已保留在 snap 中，供 Phase A 使用
+                }
+                break;
             }
 
-            SkPaint thumb_paint;
-            thumb_paint.setColor(SkColorSetARGB(128, 128, 128, 128)); // 半透明灰色
-            thumb_paint.setStyle(SkPaint::kFill_Style);
-            thumb_paint.setAntiAlias(true);
-            canvas->drawRect(thumb, thumb_paint);
+            case LayerSnapshot::Type::kSolidColor: {
+                // SolidColorLayer: 纯色填充 (§4.1.1 v1.6 P0 A1)
+                //
+                // 使用 drawColor 填充整个裁剪区域。
+                // SkBlendMode::kSrc 确保完全覆盖（忽略目标像素），
+                // 等效于 Chromium 中 SolidColorLayer 的 Overdraw 行为。
+                SkColor4f solid_color = snap.solid_color;
+                solid_color.fA *= snap.opacity;
+                canvas->drawColor(solid_color, SkBlendMode::kSrc);
+                break;
+            }
 
-            break;
+            case LayerSnapshot::Type::kScrollbar: {
+                // ScrollbarLayer: 滚动条绘制 (§4.1.1 v1.6 P0 A1)
+                //
+                // 根据 scrollbar_vertical 和 scrollbar_position / thumb_size
+                // 计算滑块矩形并绘制。
+                //
+                // 绘制策略:
+                //   1. 先绘制轨道背景 (track rect = bounds, 浅灰色)
+                //   2. 再绘制滑块 (thumb rect, 深灰色圆角矩形)
+                //
+                // scrollbar_position: 滑块起始位置比例 (0.0 ~ 1.0)
+                // scrollbar_thumb_size: 滑块大小比例 (0.0 ~ 1.0)
+
+                const SkRect& track = snap.bounds;
+                float thumb_pos   = snap.scrollbar_position;
+                float thumb_ratio = snap.scrollbar_thumb_size;
+
+                // 钳制参数到合法范围
+                if (thumb_pos < 0.0f) thumb_pos = 0.0f;
+                if (thumb_pos > 1.0f) thumb_pos = 1.0f;
+                if (thumb_ratio < 0.0f) thumb_ratio = 0.0f;
+                if (thumb_ratio > 1.0f) thumb_ratio = 1.0f;
+
+                // ── 轨道背景 ──
+                SkPaint track_paint;
+                track_paint.setColor(SkColorSetARGB(60, 0, 0, 0));   // 半透明深灰
+                track_paint.setStyle(SkPaint::kFill_Style);
+                track_paint.setAlphaf(track_paint.getAlphaf() * snap.opacity);
+                canvas->drawRect(track, track_paint);
+
+                // ── 滑块 ──
+                SkRect thumb;
+                if (snap.scrollbar_vertical) {
+                    // 垂直滚动条: 滑块沿 Y 轴移动
+                    float track_height = track.height();
+                    float thumb_height = track_height * thumb_ratio;
+                    float thumb_y      = track.fTop + (track_height - thumb_height) * thumb_pos;
+                    thumb = SkRect::MakeXYWH(track.fLeft, thumb_y,
+                                             track.width(), thumb_height);
+                } else {
+                    // 水平滚动条: 滑块沿 X 轴移动
+                    float track_width  = track.width();
+                    float thumb_width  = track_width * thumb_ratio;
+                    float thumb_x      = track.fLeft + (track_width - thumb_width) * thumb_pos;
+                    thumb = SkRect::MakeXYWH(thumb_x, track.fTop,
+                                             thumb_width, track.height());
+                }
+
+                SkPaint thumb_paint;
+                thumb_paint.setColor(SkColorSetARGB(128, 128, 128, 128)); // 半透明灰色
+                thumb_paint.setStyle(SkPaint::kFill_Style);
+                thumb_paint.setAntiAlias(true);
+                thumb_paint.setAlphaf(thumb_paint.getAlphaf() * snap.opacity);
+                canvas->drawRect(thumb, thumb_paint);
+
+                break;
+            }
+
+            case LayerSnapshot::Type::kTexture:
+            case LayerSnapshot::Type::kVideo:
+            case LayerSnapshot::Type::kSurface:
+                // 非 MVP 图层类型 — 降级为空操作。
+                // 这些图层类型在 v4 MVP Phase C 中不被采集，
+                // 若因集成错误到达此处，静默跳过（不崩溃）。
+                //
+                // TODO(Phase D): 实现 TextureLayer (WebGL/Canvas),
+                //                VideoLayer (<video>), SurfaceLayer (iframe)
+                break;
+            }
+
+        } catch (...) {
+            canvas->restore();
+            throw;
         }
-
-        case LayerSnapshot::Type::kTexture:
-        case LayerSnapshot::Type::kVideo:
-        case LayerSnapshot::Type::kSurface:
-            // 非 MVP 图层类型 — 降级为空操作。
-            // 这些图层类型在 v4 MVP Phase C 中不被采集，
-            // 若因集成错误到达此处，静默跳过（不崩溃）。
-            //
-            // TODO(Phase D): 实现 TextureLayer (WebGL/Canvas),
-            //                VideoLayer (<video>), SurfaceLayer (iframe)
-            break;
-        }
-
         canvas->restore();
     }
 
@@ -517,8 +534,7 @@ FrameBuffer FrameAssembler::assembleFrame(
 // FrameAssembler — Canvas 工厂注入 (测试/模拟)
 // ═══════════════════════════════════════════════════════════════
 
-void FrameAssembler::setCanvasFactory(CanvasFactory factory) {
-    canvas_factory_ = std::move(factory);
-}
+// setCanvasFactory is defined inline in layer_recorder.h (header-only)
+// No out-of-line definition needed.
 
 }  // namespace garnet
