@@ -396,6 +396,10 @@ void CommandBuffer::writeBool(bool value) {
 /// @param len  字节数
 void CommandBuffer::writeBlob(const uint8_t* data, size_t len) {
     if (len == 0) return;
+    // 安全: 禁止 nullptr + len>0 的未定义行为（C++ 标准 [expr.add]）
+    if (data == nullptr) {
+        throw std::invalid_argument("writeBlob: null data with non-zero length");
+    }
     ensureCapacity(len);
     buffer_.insert(buffer_.end(), data, data + len);
 }
@@ -655,6 +659,9 @@ void CommandBuffer::writeTextBlob(const SkTextBlob* blob) {
         }
     }
 }
+
+// ====== 前向声明 (在 writeImage 之前使用) ======
+static CommandBuffer::ImageHash ComputeImageSHA256(const SkImage* image);
 
 /// @brief 序列化图像引用（完整实现，涉及图像槽位管理）。
 ///
