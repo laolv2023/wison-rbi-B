@@ -1,10 +1,15 @@
-# Wison-RBI C++ Compositor 拦截层：全量审计与生产级实现方案
+# Wison-RBI C++ Compositor 拦截层：全量审计与生产级实现方案（v2 修正版）
 
 > **审计对象**: R18-CRITICAL 可行性评估方案（原始评估）  
 > **目标版本**: Chromium 143.0.7499.192-1 (Stable: 2025-12-02)  
-> **审计日期**: 2026-06-26  
+> **初版日期**: 2026-06-26  
+> **修正日期**: 2026-06-26（基于两份独立第三方审核意见修正）  
 > **角色**: 系统架构师 / 资深浏览器专家 / 资深 C++ 开发工程师  
-> **审计方法**: 代码级逐文件审查 + Chromium cc/ 层架构验证 + 安全边界审计 + 协议一致性校验
+> **审计方法**: 代码级逐文件审查 + Chromium cc/ 层架构验证 + 安全边界审计 + 协议一致性校验  
+> 
+> **v2 修正来源**：
+> - 架构级审核（TRC 代表）：指出 Viz/Blink 管线错位、pixelmatch 伪命题、增量渲染缺失等 10 项架构问题
+> - 代码级审核（资深 C++ 审查）：发现 4 个事实性错误、3 个方法论缺陷、3 个技术方案缺陷
 
 ---
 
@@ -46,7 +51,7 @@
 
 1. **`PaintOp` 序列化格式在 M143 中已引入 `DrawSlugOp`**（Skia 文本渲染优化，M127+）。原方案未提及该新 op 类型，若拦截后直接中继 PaintOp，客户端需要对应版本的 CanvasKit 反序列化支持。
 
-2. **OOP 光栅化（Out-of-Process Rasterization）在 M143 中已全面默认启用**。`DisplayItemList` 由 Viz 进程持有，Compositor 线程访问需要 Lock + DeepCopy。原方案虽在注释中提及（`v1.6 P1 A2`），但未评估该锁的耗时影响（~0.5-2ms per layer）。
+2. **OOP 光栅化（Out-of-Process Rasterization）在 M143 中已全面默认启用**。`DisplayItemList` 由 `RasterSource` 持有（属于 Compositor 线程的 `PictureLayerImpl`），光栅化执行被转移到 OOP-R worker。`Finalize()` 后 PaintOpBuffer 是不可变的（const stream），跨线程只读访问是安全的。原方案中 Lock+DeepCopy 的设计可能是不必要的性能损耗——需在 M143 实际环境中验证是否真的存在竞态条件。
 
 3. **`PaintOpBufferSerializer` 类**确实存在并可参考（原方案提及），但 M143 中该类签名已变更为模板化实现，直接引用需要适配 Chromium 内部 `AlignedBuffer` 分配器。
 
@@ -69,7 +74,7 @@
 
 **原方案遗漏的风险**：
 
-1. **`SkCanvas::onDrawSlug`** (Skia m127+)。这是一个新的虚函数，用于高效的文本渲染（Slug = "skia layout unified glyph"）。如果 Chromium M143 的 Skia 已经包含此虚函数且 Compositor 层调用了它，RecordingCanvas 必须覆盖它，否则文本可能通过父类默认实现被渲染到 device bitmap。
+1. **`SkCanvas::onDrawSlug`** (Skia m127+)。这是一个新的虚函数，用于高效的文本渲染（Slug = "skia layout unified glyph"）。但在 Chromium M143 的 Compositor 路径中，Slug 并非默认启用——Chromium 主要通过 `SkTextBlob` 传递文本。**风险等级 MEDIUM**：需验证 M143 Compositor 路径是否实际触发 Slug 路径。若不触发，RecordingCanvas 不覆盖它也不会丢失文本。
 
 2. **`SkCanvas::experimental_DrawEdgeAAQuad` 和 `experimental_DrawEdgeAAImageSet`** 在某些 Chromium 路径中被直接调用（UI 线程的 Views 子系统），这些也是虚函数，RecordingCanvas 需要拦截。
 
@@ -79,7 +84,7 @@
 
 | 虚函数 | 原 RecordingCanvas 声明 | M143 必要性 | 备注 |
 |--------|----------------------|------------|------|
-| `onDrawSlug` | **未声明** | **必须覆盖** | M127+ 新增，Chromium 文本渲染关键路径 |
+| `onDrawSlug` | **未声明** | **需验证** | M127+ 新增，Chromium 未默认启用 Slug 路径；若不触发则无需覆盖 |
 | `experimental_DrawEdgeAAQuad` | 声明为 `drawEdgeAAQuad` | 需要覆盖 | 可能被 Views 子系统调用 |
 | `onDrawMesh` | **未声明** | **可能需要** | Skia m130+，Chromium 尚未广泛使用 |
 | `onDrawAtlas` | 声明为 `drawAtlas` | 需要覆盖 | WebGL Canvas 路径使用 |
@@ -101,7 +106,7 @@
 
 | 风险 | 级别 | 描述 |
 |------|------|------|
-| **Skia onDrawSlug 文本路径** | HIGH | Slug 是 Skia 内部文本优化，序列化格式不公开，需查阅 Skia 源码确定序列化方案 |
+| **Skia onDrawSlug 文本路径** | MEDIUM | Slug 是 Skia 内部文本优化。需验证 Chromium M143 Compositor 是否实际触发，若不触发则无需覆盖 |
 | **字体回退的一致性** | HIGH | 服务端使用系统字体（如 Noto Sans CJK），客户端 CanvasKit 只有内置的默认回退字体。同一 glyph ID 在不同字体文件中指向不同的字形轮廓 |
 | **Chromium 143 中 Skia 的 `serialize()` API 版本变化** | MEDIUM | `SkTextBlob::serialize()`、`SkPath::serialize()` 等序列化 API 的二进制格式可能在 m130+ 中变更 |
 | **WebCodecs VideoFrame 集成** | MEDIUM | M143 已支持 WebCodecs，`VideoLayer` 捕获可能需要适配新的 VideoFrame 句柄 |
@@ -110,14 +115,14 @@
 
 原方案：21-34 人天（阶段不可知 → 未绑定版本）
 
-| 任务 | 原估算 | 审计修正 | 修正理由 |
-|------|--------|--------|---------|
-| RecordingCanvas 实现 | 8-12 人天 | **12-18 人天** | 需覆盖 `onDrawSlug`、验证 M143 Skia API、端到端一致性调测 |
-| LayerRecorder 实现 | 5-8 人天 | **6-10 人天** | OOP 光栅化 DeepCopy 路径增加复杂度 |
-| FrameAssembler 实现 | 3-5 人天 | **3-5 人天** | 维持原估算 |
-| Chromium 源码修改 | 2-4 人天 | **3-5 人天** | M143 中 DrawLayers 可能已重构，需要额外的集成点调整 |
-| 编译 & 集成测试 | 3-5 人天 | **5-8 人天** | 需要编译 M143 完整 Chromium（首次构建耗时 4-8 小时）+ 字体一致性测试 |
-| **总计** | **21-34 人天** | **29-46 人天** | |
+| 任务 | 原估算 | 审计修正 | v2 再修正 | 修正理由 |
+|------|--------|--------|----------|---------|
+| RecordingCanvas 实现 | 8-12 人天 | 12-18 人天 | **15-22 人天** | 需恢复 8 个 #include + override 关键字（非简单取消注释）；onDrawSlug 验证；端到端一致性调测 |
+| LayerRecorder 实现 | 5-8 人天 | 6-10 人天 | **6-10 人天** | OOP-R 下无需 DeepCopy（PaintOpBuffer Finalize 后不可变），但需验证 |
+| FrameAssembler 实现 | 3-5 人天 | 3-5 人天 | **3-5 人天** | 维持，但需修正伪代码 API 调用 |
+| Chromium 源码修改 | 2-4 人天 | 3-5 人天 | **4-6 人天** | AppendQuads 不适合做唯一拦截点（tiling 多次调用），需在 UpdateTiles 增加辅助钩子 |
+| 编译 & 集成测试 | 3-5 人天 | 5-8 人天 | **6-10 人天** | 首次 Chromium 编译 4-8h；CanvasKit 版本匹配验证 1-2 天；增量编译 15-30min/次 |
+| **总计** | **21-34** | **29-46** | **34-53 人天** | **v2 修正基于实际代码编译障碍和 API 精确核实** |
 
 **关键假设**：
 - 工程师已具备 Chromium C++ 开发经验（熟悉 `gn`/`ninja` 构建系统）
@@ -158,8 +163,10 @@ Skia 对象序列化（writePaint/writePath/writeTextBlob...）: ~5%  ❌ (1/20+
 图像编码（encodeToData）:                                  0%  ❌
 SHA-256 哈希:                                             0%  ❌
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-加权完整度（按代码量和复杂度权重）:                          ~45%
+加权完整度（按代码量和复杂度权重）:                          ~30-35%
 ```
+
+> **v2 修正**：原估算 45% 偏乐观。`recording_canvas.cpp`（~1200 行）、`layer_recorder.cpp`（~600 行）、`garnet_interceptor.h/cpp`（~300 行）均需从零创建。Skia 序列化 stub 函数实际需求 ~500+ 行（非原估算 ~200 行）。按代码量加权后完整度更接近 30-35%。
 
 ### 1.5 替代方案审计
 
@@ -198,7 +205,7 @@ SHA-256 哈希:                                             0%  ❌
   6. 实现 LayerRecorder::recordPictureLayer（含 OOP 光栅化 DeepCopy）
   7. 实现 FrameAssembler::assembleFrame
   8. 修改 2 个 Chromium 文件（picture_layer_impl.cc + layer_tree_host_impl.cc）
-  9. 字体一致性验证套件（pixelmatch < 1% diff）
+  9. 字体/布局/主色调结构化一致性验证套件（SSIM > 0.95）
 ```
 
 ---
@@ -304,17 +311,37 @@ C++ 标准：  C++20（M143 全面迁移）
 | P0.4 | 确定 M143 bundled Skia 版本（`third_party/skia/README.chromium`） | 记录 Skia commit hash |
 | P0.5 | 确定对应的 CanvasKit npm 版本 | 验证 `canvaskit-wasm` 版本与 Skia 版本兼容 |
 
-#### Phase A：核心绘制拦截（12-18 人天）
+#### Phase A：核心绘制拦截（15-22 人天）
 
-**目标**：端到端渲染闭环 —— 简单网页（纯色背景 + 文本 + 图像）从 Chromium → CommandBuffer → 客户端 CanvasKit 渲染，视觉一致性 < 1% pixelmatch diff。
+**目标**：端到端渲染闭环 —— 简单网页（纯色背景 + 文本 + 图像）从 Chromium → CommandBuffer → 客户端 CanvasKit 渲染，结构化一致性校验通过（SSIM > 0.95，非像素级对比）。
 
-##### A1. RecordingCanvas 骨架实现（3-5 人天）
+##### A1. RecordingCanvas 骨架实现（4-6 人天）
 
 ```
 文件：garnet/recording_canvas.h + recording_canvas.cpp
 ```
 
-1. **恢复 `SkCanvas` 继承关系**：
+> **v2 修正**：当前代码不仅是继承被注释——8 个 Skia `#include` 也被注释（L50-58），`onReadPixels` 缺少 `override` 关键字且 `SkPixmap` 类型未引入。整个文件**当前无法编译**。需同时恢复 includes + inheritance + override。
+
+1. **恢复 Skia 头文件引用**（取消注释 L50-58）：
+   ```cpp
+   // 之前（全部注释）:
+   // #include "include/core/SkCanvas.h"
+   // ...
+   
+   // 之后:
+   #include "include/core/SkCanvas.h"
+   #include "include/core/SkBitmap.h"
+   #include "include/core/SkPaint.h"
+   #include "include/core/SkPath.h"
+   #include "include/core/SkTextBlob.h"
+   #include "include/core/SkImage.h"
+   #include "include/core/SkVertices.h"
+   #include "include/core/SkM44.h"
+   #include "include/core/SkRRect.h"
+   ```
+
+2. **恢复 `SkCanvas` 继承关系**：
    ```cpp
    // 之前（注释掉的）:
    class RecordingCanvas /* : public SkCanvas */ {
@@ -352,10 +379,11 @@ C++ 标准：  C++20（M143 全面迁移）
        , save_depth_(0) {}
    ```
 
-4. **实现 `onReadPixels` 覆盖**（安全不变量 I-1）：
+4. **实现 `onReadPixels` 覆盖**（安全不变量 I-1，**需添加 `override` 关键字**）：
    ```cpp
-   // recording_canvas.cpp
-   bool RecordingCanvas::onReadPixels(const SkPixmap&, int, int) {
+   // recording_canvas.cpp — 当前 L318 缺少 override 且 SkPixmap 类型未引入
+   // v2 修正后：
+   bool RecordingCanvas::onReadPixels(const SkPixmap& dst, int x, int y) override {
        return false;  // 绝对禁止像素回读
    }
    ```
@@ -422,7 +450,7 @@ void RecordingCanvas::onDrawPath(const SkPath& path, const SkPaint& paint) {
 | 函数 | 格式 | 预估行数 |
 |------|------|---------|
 | `writeRect` | l(f32) + t(f32) + r(f32) + b(f32) = 16B | 10 |
-| `writePaint` | 递归序列化 Paint 树 | 150-200 |
+| `writePaint` | 递归序列化 Paint 树（含 Shader/MaskFilter/ColorFilter/PathEffect/ImageFilter/Blender 子树） | 500-800 |
 | `writePath` | verbCount(u32) + pointCount(u32) + verbs[u8*] + points[f32*] | 50 |
 | `writeTextBlob` | 遍历 glyph run，序列化 glyphs + positions + fonts | 100-150 |
 | `writeRRect` | type(u8) + rect(16B) + radii[4](32B) = 49B | 20 |
@@ -438,7 +466,20 @@ void RecordingCanvas::onDrawPath(const SkPath& path, const SkPaint& paint) {
 | `writeShadowRec` | shadowRec 结构序列化 |
 | `writeImageFilter` | 递归序列化 ImageFilter 树（SkImageFilter::serialize） |
 
-**`writePaint` 实现概览**（最复杂的序列化函数）：
+**`writePaint` 实现概览**（最复杂的序列化函数，**v2 修正：500-800 行**）：
+
+```cpp
+// command_buffer.cpp — writePaint
+// 需要递归序列化整个 Paint 效果树：
+//   SkShader       — 7+ 子类 (Gradient/Image/PerlinNoise/...)
+//   SkMaskFilter   — 3 子类 (Blur/Table/Shader)
+//   SkColorFilter  — 6 子类 (Matrix/Table/Lighting/...)
+//   SkPathEffect   — 5 子类 (Dash/Corner/Sum/Compose/...)
+//   SkImageFilter  — 15+ 子类 (Blur/DropShadow/Matrix/Blend/...)
+//   SkBlender      — 自定义混合模式
+// 仅 writeImageFilter 递归树就可达 300+ 行
+// 复杂 Paint 序列化可达 1000+ 字节（含 Runtime Effect SkSL）
+
 
 ```cpp
 // command_buffer.cpp — writePaint
@@ -521,6 +562,8 @@ void CommandBuffer::encodePendingImages() {
 
 ##### A6. FrameAssembler::assembleFrame 实现（1-2 人天）
 
+> **v2 修正**：`AssembleFrame` 是自由函数（`command_buffer.cpp:927`），签名是 `FrameBuffer AssembleFrame(const FrameHeader&, const CommandBuffer&)`，无 `assembleFrameHeader` 方法，且已内置 CRC32 计算和写入。原伪代码的双重 CRC32 bug 已修正。
+
 ```cpp
 // layer_recorder.cpp — assembleFrame()
 std::vector<uint8_t> FrameAssembler::assembleFrame(
@@ -530,54 +573,48 @@ std::vector<uint8_t> FrameAssembler::assembleFrame(
     // 1. 创建 RecordingCanvas
     auto canvas = RecordingCanvas::Create(
         header_params.canvas_w, header_params.canvas_h,
-        ImageMode::kInline);  // 或从配置读取
+        ImageMode::kInline);
     
     // 2. 从 LayerRecorder 获取所有图层快照
     const auto& layers = recorder.getLayerSnapshots();
     
     // 3. 按 z-order 遍历图层，重放 PaintOp
     for (const auto& layer : layers) {
-        // 设置图层变换
         canvas->save();
         canvas->concat(layer.transform);
         canvas->clipRect(layer.visible_rect);
         
         if (layer.type == LayerSnapshot::Type::kPicture) {
-            // PictureLayer: 重放 PaintOp
             ReplayPaintOps(layer.paint_ops, canvas.get());
         }
-        // (Phase C 处理其他图层类型)
-        
         canvas->restore();
     }
     
-    // 4. 生成帧头 + 序列化帧
+    // 4. 获取序列化后的 CommandBuffer
     CommandBuffer buffer = canvas->finalize();
-    auto* header_buf = buffer.assembleFrameHeader(header_params);
-    auto crc32 = buffer.computeCRC32();
     
-    // 5. 合并为 FrameBuffer
-    std::vector<uint8_t> frame(
-        header_buf, header_buf + kFrameHeaderSize);
-    frame.insert(frame.end(), 
-        buffer.data(), buffer.data() + buffer.commandStreamSize());
-    // 追加 CRC32
-    frame.push_back(crc32 & 0xFF);
-    frame.push_back((crc32 >> 8) & 0xFF);
-    frame.push_back((crc32 >> 16) & 0xFF);
-    frame.push_back((crc32 >> 24) & 0xFF);
+    // 5. 调用已有自由函数 AssembleFrame（Header + Commands + CRC32）
+    //    AssembleFrame 签名: FrameBuffer(const FrameHeader&, const CommandBuffer&)
+    //    内置：30B 手动序列化帧头 + memcpy 命令流 + CRC32 计算
+    FrameBuffer fb = AssembleFrame(header_params, buffer);
     
-    return frame;
+    // 6. 转为 vector<uint8_t> 返回
+    return std::vector<uint8_t>(fb.data.get(), fb.data.get() + fb.size);
 }
 ```
 
 ##### A7. 验证标准
 
+> **v2 修正**：废弃全局 `< 1% pixelmatch diff` 指标。Native GPU (Vulkan/Metal) 与 CanvasKit WebGL 因浮点精度和 AA 实现差异，像素级对齐不可达成。改用结构化一致性校验。
+
 ```
 ✅ Chromium 启动 → 访问 https://example.com → Garnet 日志输出帧数据
 ✅ 帧数据包含 30B 帧头 + 命令流 + 4B CRC32
 ✅ 客户端 CanvasKit 反序列化 → 渲染到 <canvas>
-✅ pixelmatch(server_screenshot, client_canvas) diff < 1%
+✅ 文本：字体/字号/颜色/位置 100% 匹配（结构化对比，非像素对比）
+✅ 布局：元素边界框 ±1px
+✅ 主色调：CSS 颜色值 ±2/256 容差
+✅ 图像：SSIM > 0.95（结构相似性）
 ✅ 5 个简单测试页面通过（纯色、渐变、文本、图像、混合）
 ```
 
@@ -688,39 +725,38 @@ void LayerRecorder::recordLayerTransform(
 
 ##### B5. Chromium 源码集成补丁（2 人天）
 
-**文件 1**：`cc/trees/layer_tree_host_impl.cc`
+> **v2 修正**：原方案在 `AppendQuads` 中插入钩子存在问题——`AppendQuads` 在 tiling 策略下每帧可能被调用多次（每个 tile 一次），且不直接暴露 `PaintOpBuffer`。修正为双钩子方案。
+
+**文件 1**：`cc/trees/layer_tree_host_impl.cc` — DrawLayers 钩子
 
 ```cpp
-// 在 DrawLayers() 末尾，添加 Garnet 钩子
 void LayerTreeHostImpl::DrawLayers(FrameData* frame) {
     // ... 现有 Chromium 逻辑 ...
     
 #if defined(ENABLE_GARNET_COMPOSITOR_INTERCEPT)
-    // Garnet Compositor 拦截点——在最终 Present 前捕获所有图层
     if (garnet::GarnetInterceptor::IsEnabled()) {
         garnet::GarnetInterceptor::GetInstance()->OnDrawLayers(
-            *frame,
-            active_tree_,
-            *renderer_);
+            *frame, active_tree_, *renderer_);
     }
 #endif
 }
 ```
 
-**文件 2**：`cc/layers/picture_layer_impl.cc`
+**文件 2**：`cc/layers/picture_layer_impl.cc` — UpdateTiles 钩子（比 AppendQuads 更合适）
 
 ```cpp
-// 在 AppendQuads 或 UpdateRasterSource 中，PaintOp 生成后
-void PictureLayerImpl::AppendQuads(
-    AppendQuadsData* append_quads_data,
-    viz::CompositorRenderPass* render_pass) {
-    
+// UpdateTiles 在 tile 更新后、quad 生成前调用，RasterSource 已就绪
+void PictureLayerImpl::UpdateTiles() {
     // ... 现有 Chromium 逻辑 ...
     
 #if defined(ENABLE_GARNET_COMPOSITOR_INTERCEPT)
     if (garnet::GarnetInterceptor::IsEnabled()) {
-        garnet::GarnetInterceptor::GetInstance()->OnPictureLayerQuads(
-            id(), GetRasterSource(), append_quads_data);
+        // RasterSource 在此阶段已完整，可直接获取 DisplayItemList
+        auto* raster_source = GetRasterSource();
+        if (raster_source) {
+            garnet::GarnetInterceptor::GetInstance()->OnPictureLayerUpdated(
+                id(), raster_source);
+        }
     }
 #endif
 }
@@ -781,12 +817,12 @@ cc/BUILD.gn                           # +1 行（依赖 garnet）
 
 | # | 风险 | 概率 | 影响 | 缓解措施 |
 |---|------|------|------|---------|
-| R1 | `SkSlug` 无公开序列化 API | 中 | 高 | 降级为 NOOP（文本路径回退到 `onDrawTextBlob`） |
-| R2 | CanvasKit 0.39.x 与 M143 Skia 不完全匹配 | 中 | 高 | 自编译 CanvasKit WASM，确保完全匹配 |
-| R3 | OOP 光栅化 DeepCopy 延迟超出预期 | 低 | 中 | 仅在 `--garnet-raster-mode=record-only` 时启用 Lock+DeepCopy |
+| R1 | `SkSlug` 无公开序列化 API | 低 | 低 | Chromium M143 未默认启用 Slug 路径；若实际不触发则无需处理 |
+| R2 | CanvasKit 0.39.x 与 M143 Skia 不完全匹配 | 中 | 高 | 自编译 CanvasKit WASM 确保精确匹配（额外 +3 天）；或走 npm 匹配版 |
+| R3 | OOP 光栅化 DeepCopy 不必要 | 低 | 低 | PaintOpBuffer Finalize 后不可变，跨线程只读安全；移除 DeepCopy |
 | R4 | GPU 纹理回读路径不可用（TextureLayer） | 中 | 中 | 降级为纯色占位矩形（Phase C 已知限制） |
 | R5 | Chromium M144+ API Breaking Change | 高 | 高 | 锁定 M143，季度性评估升级窗口 |
-| R6 | 字体一致性无法达到 < 1% diff | 中 | 高 | 在 CanvasKit 中内嵌 Noto Sans 字体，服务端使用匹配版本 |
+| R6 | 字体一致性无法达到（服务端 vs 客户端 HarfBuzz/字体回退差异） | 中 | 高 | 在 CanvasKit 中内嵌 Noto Sans 字体，服务端使用匹配版本；服务端完成全部 shaping |
 
 ### 3.5 成功标准（按阶段）
 
@@ -797,7 +833,7 @@ cc/BUILD.gn                           # +1 行（依赖 garnet）
 [ ] headless 模式访问 example.com → Garnet 日志中可见帧数据
 [ ] 帧数据包含：30B 帧头 + 5+ 条命令 + 4B CRC32
 [ ] 客户端解压 + CRC 校验通过
-[ ] CanvasKit 渲染结果对以下 5 个测试页面 pixelmatch diff < 1%:
+[ ] CanvasKit 渲染结果对以下 5 个测试页面 SSIM > 0.95：
     1. 纯色页面 (solid red)
     2. CSS 渐变 (linear-gradient)
     3. 纯文本页面 (Lorem ipsum)
@@ -830,9 +866,116 @@ cc/BUILD.gn                           # +1 行（依赖 garnet）
 
 ---
 
-## 四、客户端 CanvasKit 版本匹配策略
+## 四、跨端一致性审查（v2 新增）
 
-### 4.1 版本匹配方案
+> **来源**：两份独立审计均指出原方案仅审查了 C++ 服务端代码，遗漏了客户端和服务端的实现状态验证。
+
+### 4.1 客户端代码状态（`client/`）
+
+| 文件 | 状态 | 与 C++ 方案的关系 |
+|------|------|------------------|
+| `protocol.js` | ✅ 实现 | Opcode 常量定义——需与 `frame_constants.h` 逐项对齐 |
+| `command_validator.js` | ✅ 实现 | 9 层白名单校验——已验证 Opcode 白名单与 C++ 一致 |
+| `index.js` (帧处理) | ✅ 实现 | 当前处理 Node.js 服务端帧——切换到 C++ CommandBuffer 后需适配二进制格式 |
+| `font_registry.js` | ✅ 实现 | 客户端字体 LRU——C++ 字体内联传输需与此模块对接 |
+| `image_cache.js` | ✅ 实现 | 图像 LRU 缓存——C++ hash-ref 模式需与此模块对接 |
+
+**关键发现**：客户端已有完整的反序列化和安全校验基础设施，但**当前协议层是 Node.js 服务端产生的 JSON/二进制混合格式**。切换到 C++ CommandBuffer 后，需要修改 `index.js` 中的帧解析路径以适配纯二进制协议。**客户端端并非空白**，这降低了一部分集成风险。
+
+### 4.2 服务端 Node.js 代码状态（`server/`）
+
+| 文件 | 状态 | 与 C++ 方案的关系 |
+|------|------|------------------|
+| `frame_builder.js` | ✅ 实现 | **当前承担 CommandBuffer 的角色**（JS 层帧组装 + CRC32 + gzip）——C++ 方案将替代此模块 |
+| `chromium_manager.js` | ✅ 实现 | Chromium 进程池——需增加 Garnet 启动参数传递 |
+| `io_proxy.js` | ✅ 实现 | CDP 输入代理——不受 C++ 方案影响 |
+
+**关键发现**：`frame_builder.js` 是 `CommandBuffer` 的 JS 替代实现。C++ 方案落地后它将退役。在此之前，它可作为 C++ 实现的**参考基准和兼容性测试对照**。
+
+---
+
+## 五、关键路径分析（v2 新增）
+
+### 5.1 分阶段关键路径
+
+```
+Phase A 关键路径（不可并行）：
+  A1(骨架) → A2(5个虚函数) → A3(序列化函数) → A6(FrameAssembler) → 集成调试
+  串行长度：15-22 人天
+
+Phase A 可并行：
+  A4(SHA-256) ∥ A5(图像编码) ∥ A2/A3
+  节省：2-3 人天
+
+Phase B 关键路径：
+  B1(onDraw* 补齐) → 集成调试
+  串行长度：10-15 人天
+  B2(onDrawSlug 验证) ∥ B3(序列化补齐) ∥ B1
+```
+
+### 5.2 修正后总工期
+
+| 路径 | 串行人天 |
+|------|---------|
+| Phase 0 关键路径 | 3-5 天（npm 路径）/ 6-8 天（自编译路径） |
+| Phase A 关键路径 | 15-22 天 |
+| Phase B 关键路径 | 10-15 天 |
+| Phase C 关键路径 | 8-12 天 |
+| Phase D 关键路径 | 5-8 天 |
+| **总计（含并行优化）** | **34-53 人天** |
+
+> 1-2 名 C++ 工程师 + 1 名前端工程师，约 **5-8 周**。
+
+---
+
+## 六、内存预算估算（v2 新增）
+
+| 场景 | 内存项 | 估算 |
+|------|--------|------|
+| **空闲** | CommandBuffer 预分配 | 64 KB |
+| **简单页面**（10 张图片） | buffer + 10×sk_sp 引用 | ~2 MB |
+| **复杂页面**（50 张 4K 图片） | buffer + 50×sk_sp 引用（每张 33MB 内存持有） | **峰值 ~500 MB** |
+| **极限场景** | kMaxBytesPerFrame (64MB) + 100 张图片 sk_sp | ~700 MB |
+
+**缓解措施**：
+- `sk_sp<SkImage>` 仅持有引用（非拷贝），图像内存由 Chromium 资源管理
+- 帧间 `clear()` 释放 buffer + slots，释放图像引用
+- 极限场景 700MB 在 `kChromiumMaxMemoryBytes`（2GB）的 35% 以内，可接受
+
+---
+
+## 七、测试策略（v2 新增）
+
+### 7.1 单元测试
+
+| 测试类型 | 覆盖范围 | 框架 |
+|----------|---------|------|
+| **Round-trip 测试** | `CommandBuffer` 序列化 → 反序列化 → 校验一致性 | gtest（C++ 端） |
+| **Opcode 白名单** | 所有合法 opcode (0x01-0x7F) 的序列化/反序列化 | gtest |
+| **边界测试** | 空帧、单命令、kMaxPayloadBytes 边界、kMaxBytesPerFrame 边界 | gtest |
+| **CRC32 一致性** | 服务端 C++ CRC32 ↔ 客户端 JS CRC32 结果一致 | 跨语言测试 |
+
+### 7.2 集成测试
+
+| 测试类型 | 覆盖范围 |
+|----------|---------|
+| **视觉回归** | 自动化截图对比（SSIM > 0.95），5 个基准页面 × 10 次采样 |
+| **端到端延迟** | WebSocket RTT + 帧处理延迟，P50/P95/P99 |
+| **内存泄漏** | Chromium 运行 30 分钟，RSS 增长曲线（目标 < 100MB/hour） |
+
+### 7.3 Chaos 测试
+
+| 测试类型 | 覆盖范围 |
+|----------|---------|
+| **Fuzzing** | libFuzzer 对 CommandBuffer 反序列化路径 |
+| **恶意帧注入** | 构造超限 payload/越界 count/非法 opcode 帧 |
+| **断线重连** | WebSocket 断开后关键帧请求恢复 |
+
+---
+
+## 八、客户端 CanvasKit 版本匹配策略
+
+### 8.1 版本匹配方案
 
 ```
 方案 1（推荐）：自编译 CanvasKit WASM
@@ -853,7 +996,7 @@ cc/BUILD.gn                           # +1 行（依赖 garnet）
   劣势：需要维护多版本 CDN
 ```
 
-### 4.2 推荐策略
+### 8.2 推荐策略
 
 **方案 1 + 方案 3 结合**：
 - 开发/测试阶段：方案 1 自编译，确保 100% 精确匹配
@@ -861,29 +1004,38 @@ cc/BUILD.gn                           # +1 行（依赖 garnet）
 
 ---
 
-## 五、总结
+## 九、总结
 
-### 原方案审计结论
+### 原方案审计结论（v2 修正后）
 
-| 维度 | 原评估 | 审计修正 | 关键差异 |
-|------|--------|--------|---------|
-| 技术可行性 | 中等 | 中等→偏高 | M143 引入了 `onDrawSlug` 等新 API，但 Skia 层稳定性实际高于预期 |
-| 技术风险 | 高 | 高（风险项重新排序） | #1 风险已从"API 不稳定"变为"渲染一致性" |
-| 工作量 | 21-34 人天 | 29-46 人天 | 增加了 Slug 处理 + OOP DeepCopy + M143 编译环境搭建 |
-| 代码复用度 | 隐含 100% | **实际 ~45%** | 基础写入层完整但 Skia 序列化层几乎全部是 stub |
-| 替代方案 | 3 个 | 5 个（新增路径 C、B'） | 提供了更多渐进攻关选项 |
-| 生产可行性 | 不可生产 | **不可生产（MVP 条件更具体）** | 明确了 9 项而非原 3 项 MVP 条件 |
+| 维度 | 原评估 | v1 审计修正 | v2 再修正 | 关键差异 |
+|------|--------|-----------|----------|---------|
+| 技术可行性 | 中等 | 中等→偏高 | 中等→偏高 | v2 修正了 OOP-R 进程模型（无需 DeepCopy），降低了复杂性 |
+| 技术风险 | 高 | 高（重排序） | 高（onDrawSlug 降级） | onDrawSlug 从 HIGH→MEDIUM；SkPicture 复用方案作为新选择 |
+| 工作量 | 21-34 人天 | 29-46 人天 | **34-53 人天** | v2 加入 includes 恢复 + override 修正 + writePaint 500-800 行 + CanvasKit 版本匹配 |
+| 代码复用度 | 隐含 100% | ~45% | **~30-35%** | v2 核算更精确：recording_canvas.cpp/layer_recorder.cpp/garnet_interceptor 均从零创建 |
+| 替代方案 | 3 个 | 5 个 | 6 个（+SkPicture 复用） | 新增 SkPicture::MakeFromData 路径（建议 1 周 PoC） |
+| 生产可行性 | 不可生产 | 不可生产（9 项 MVP） | 不可生产（9 项 MVP + 增量渲染前置） | 增量渲染从 Phase 4 提升至 Phase A；废弃 pixelmatch |
+
+### 两份独立审计的综合采纳
+
+| 来源 | 采纳项 | 讨论/推迟项 |
+|------|--------|-----------|
+| **架构级审计** | 废弃 pixelmatch、增量渲染前移、SkSlug 不降级、ImageFilter 降级为位图 | 混合渲染管线→v2.0；SkPicture 复用→独立 PoC |
+| **代码级审计** | 4 个事实性错误修正、writePaint 500-800 行、完整度 30-35%、assembleFrame bug 修正、AppendQuads→UpdateTiles | Phase 0 工期保持 3-5 天（npm 路径） |
 
 ### 推荐执行路径
 
 ```
-Phase 0 (2-3 天) → Phase A (12-18 天) → 可演示 MVP
-                                        → Phase B (8-12 天) → 完整绘制覆盖
-                                                            → Phase C (5-8 天) → 全图层类型
-                                                                                → Phase D (3-5 天) → 生产加固
+Phase 0 (3-5d) ───→ Phase A (15-22d) ───→ 可演示 MVP
+           npm 路径       含增量渲染                            
+                         
+SkPicture PoC (1 周，独立并行)
+
+Phase B (10-15d) → 完整绘制覆盖 → Phase C (8-12d) → 全图层类型 → Phase D (5-8d) → 生产加固
 ```
 
-**总工期**: 30-46 人天（1-2 名 C++ 工程师 + 1 名前端工程师，约 4-6 周）
+**总工期**: 34-53 人天（1-2 名 C++ 工程师 + 1 名前端工程师，约 5-8 周）
 
 ---
 
