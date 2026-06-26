@@ -47,15 +47,23 @@
 #include "command_buffer.h"
 
 // Skia 实际头文件路径 (Chromium 源码树):
-// #include "include/core/SkCanvas.h"
-// #include "include/core/SkBitmap.h"
-// #include "include/core/SkPaint.h"
-// #include "include/core/SkPath.h"
-// #include "include/core/SkTextBlob.h"
-// #include "include/core/SkImage.h"
-// #include "include/core/SkVertices.h"
-// #include "include/core/SkM44.h"
-// #include "include/core/SkRRect.h"
+#include "include/core/SkCanvas.h"
+#include "include/core/SkBitmap.h"
+#include "include/core/SkPaint.h"
+#include "include/core/SkPath.h"
+#include "include/core/SkTextBlob.h"
+#include "include/core/SkImage.h"
+#include "include/core/SkVertices.h"
+#include "include/core/SkM44.h"
+#include "include/core/SkRRect.h"
+#include "include/core/SkPixmap.h"
+#include "include/core/SkGlyphRunList.h"
+#include "include/core/SkDrawShadowRec.h"
+#include "include/core/SkSamplingOptions.h"
+#include "include/core/SkRSXform.h"
+#include "include/core/SkDrawable.h"
+#include "include/core/SkRegion.h"
+#include "include/core/SkData.h"
 
 namespace garnet {
 
@@ -71,7 +79,7 @@ namespace garnet {
 ///   3. 所有 onDraw* 虚函数将参数序列化到 CommandBuffer
 ///   4. finalize() → 返回填充完毕的 CommandBuffer
 ///   5. RecordingCanvas 实例不再可用（recording_ = false）
-class RecordingCanvas /* : public SkCanvas */ {
+class RecordingCanvas : public SkCanvas {
 public:
     /// @brief 工厂方法: 创建 RecordingCanvas 实例。
     ///
@@ -315,7 +323,7 @@ public:
     ///          bool onReadPixels(const SkPixmap& dst, int x, int y) override { return false; }
     ///
     /// @returns 始终 false（拒绝所有读像素请求）
-    bool onReadPixels(const SkPixmap&, int, int) { return false; }
+    bool onReadPixels(const SkPixmap& dst, int x, int y) override { return false; }
 
     // ═══════════════════════════════════════════════════════════
     // 非 PictureLayer 图层采集 — v1.6 P0 A1
@@ -364,29 +372,23 @@ public:
 private:
     /// @brief 私有构造函数（通过工厂方法 Create() 创建）。
     ///
-    /// Phase 3 实现:
-    ///   创建最小化 SkBitmap (1×1, kRGBA_8888) 作为 device，
-    ///   传递给 SkCanvas 基类构造函数。该 device 仅用于满足
-    ///   SkCanvas 的 API 契约，所有 onDraw* 虚函数均已重写，
-    ///   不会向其写入实际像素。
-    ///
-    /// Chromium 源码树集成时签名:
-    ///   RecordingCanvas(SkBitmap device, int width, int height,
-    ///                   ImageMode image_mode);
+    /// 创建最小化 SkBitmap (1×1, kN32_SkColorType) 作为 device，
+    /// 传递给 SkCanvas 基类构造函数。该 device 仅用于满足
+    /// SkCanvas 的 API 契约，所有 onDraw* 虚函数均已重写，
+    /// 不会向其写入实际像素。
     ///
     /// @param width      物理画布宽度 (px)
     /// @param height     物理画布高度 (px)
     /// @param image_mode 图像传输模式
-    RecordingCanvas(int width, int height, ImageMode image_mode);
+    RecordingCanvas(int width, int height, ImageMode image_mode,
+                    const SkBitmap& device);
 
     CommandBuffer buffer_;     ///< 序列化命令缓冲区（录制目标）
     int width_;                ///< 物理画布宽度
     int height_;               ///< 物理画布高度
     ImageMode image_mode_;     ///< 图像传输模式
     bool recording_;           ///< 录制状态标志
-
-    // Phase 3: SkCanvas 需要的最小 device（不产生光栅化开销）
-    // SkBitmap minimal_device_;  // 1×1, kRGBA_8888, 仅用于满足 SkCanvas 构造
+    SkBitmap minimal_device_;  ///< 1×1 最小 device，仅用于满足 SkCanvas 构造
 
     /// @brief Save/Restore 深度跟踪。
     ///
