@@ -1,15 +1,59 @@
-# Wison-RBI C++ Compositor 拦截层：全量审计与生产级实现方案（v2 修正版）
+# Wison-RBI C++ Compositor 拦截层：全量审计与生产级实现方案（v3 范围收窄版）
 
 > **审计对象**: R18-CRITICAL 可行性评估方案（原始评估）  
 > **目标版本**: Chromium 143.0.7499.192-1 (Stable: 2025-12-02)  
 > **初版日期**: 2026-06-26  
-> **修正日期**: 2026-06-26（基于两份独立第三方审核意见修正）  
+> **修正日期**: 2026-06-26（v2：两份独立审计 / v3：MVP 范围收窄）  
 > **角色**: 系统架构师 / 资深浏览器专家 / 资深 C++ 开发工程师  
-> **审计方法**: 代码级逐文件审查 + Chromium cc/ 层架构验证 + 安全边界审计 + 协议一致性校验  
 > 
 > **v2 修正来源**：
 > - 架构级审核（TRC 代表）：指出 Viz/Blink 管线错位、pixelmatch 伪命题、增量渲染缺失等 10 项架构问题
 > - 代码级审核（资深 C++ 审查）：发现 4 个事实性错误、3 个方法论缺陷、3 个技术方案缺陷
+> 
+> **v3 范围收窄**：明确 MVP 仅覆盖"基础 UI 与文本"，排除"网络媒体"和"复杂特效/3D"。
+
+---
+
+## 零-A、MVP 范围定义（v3 新增）
+
+### ✅ 范围内（Phase A + B 交付）
+
+| 类别 | 内容 | Skia API |
+|------|------|----------|
+| **DOM 基础绘制** | `DrawRect`/`DrawRRect`/`DrawOval`/`DrawPath`（简单路径） | `onDrawRect`/`onDrawRRect`/`onDrawOval`/`onDrawPath` |
+| **纯色与简单渐变** | CSS `background-color`、`linear-gradient`（≤2 色停止） | `onDrawPaint`/`onDrawColor`，`SkGradientShader`（线性） |
+| **文本** | 所有 `SkTextBlob` 文本（含 CJK） | `onDrawTextBlob`/`onDrawGlyphRunList` |
+| **基础图像** | PNG/JPEG `<img>`（内联传输，不含 WebP/AVIF） | `onDrawImage`/`onDrawImageRect` |
+| **图层变换** | `translate`/`scale`/`rotate`/`concat`（3×3 + 4×4） | 状态管理 + 变换命令 |
+| **裁剪** | `clipRect`/`clipRRect`/`clipPath` | 裁剪命令 |
+| **SolidColor 图层** | `SolidColorLayer` → `drawColor` 序列化 | `recordSolidColorLayer` |
+| **滚动条** | `ScrollbarLayer` 位置/方向同步 | `recordScrollbarLayer` |
+
+### ❌ 范围外（明确排除，v3 不实现）
+
+| 类别 | 排除项 | 原因 |
+|------|--------|------|
+| **网络媒体** | MP4 `<video>`、WebP/AVIF 图像、MP3 `<audio>`、SVG（复杂路径除外） | 需要 GPU 纹理回读或媒体管线；SVG 的复杂 `SkPath` 仍在范围内（Chromium 已将其转为路径） |
+| **复杂特效** | `backdrop-filter`（毛玻璃）、`blur()`、复杂 `drop-shadow`、多层混合模式 | `SkImageFilter` 子树序列化极其复杂（15+ 子类），v3 降级为位图或不渲染 |
+| **3D/WebGL** | WebGL `<canvas>`、`WebGPU`、CSS 3D `preserve-3d` | `TextureLayer`/`SurfaceLayer` GPU→CPU 回读路径不在 Phase A/B 范围内 |
+| **复杂渐变** | `radial-gradient`/`conic-gradient`/多层渐变（>2 色停止） | `SkGradientShader` 径向/锥形序列化暂不实现 |
+| **Runtime Shader** | CSS `paint()` Worklet、自定义 SkSL | 服务端 SkSL 不可跨平台传输 |
+
+### 范围边界对方案的影响
+
+```
+Phase C 大幅简化：
+  原：5 种非 PictureLayer 全采集（SolidColor/Texture/Video/Surface/Scrollbar）
+  v3：仅 SolidColorLayer + ScrollbarLayer（删除 Texture/Video/Surface）
+
+writePaint 大幅简化：
+  原：500-800 行（含 ImageFilter 15+ 子类递归）
+  v3：200-350 行（仅处理基本 Paint 属性 + 线性 GradientShader，跳过 ImageFilter）
+
+Phase B 工期缩短：
+  原：15-25 人天（含复杂 ImageFilter/Shader 序列化）
+  v3：8-14 人天（仅覆盖范围内 Skia API）
+```
 
 ---
 
@@ -115,14 +159,14 @@
 
 原方案：21-34 人天（阶段不可知 → 未绑定版本）
 
-| 任务 | 原估算 | 审计修正 | v2 再修正 | 修正理由 |
-|------|--------|--------|----------|---------|
-| RecordingCanvas 实现 | 8-12 人天 | 12-18 人天 | **15-22 人天** | 需恢复 8 个 #include + override 关键字（非简单取消注释）；onDrawSlug 验证；端到端一致性调测 |
-| LayerRecorder 实现 | 5-8 人天 | 6-10 人天 | **6-10 人天** | OOP-R 下无需 DeepCopy（PaintOpBuffer Finalize 后不可变），但需验证 |
-| FrameAssembler 实现 | 3-5 人天 | 3-5 人天 | **3-5 人天** | 维持，但需修正伪代码 API 调用 |
-| Chromium 源码修改 | 2-4 人天 | 3-5 人天 | **4-6 人天** | AppendQuads 不适合做唯一拦截点（tiling 多次调用），需在 UpdateTiles 增加辅助钩子 |
-| 编译 & 集成测试 | 3-5 人天 | 5-8 人天 | **6-10 人天** | 首次 Chromium 编译 4-8h；CanvasKit 版本匹配验证 1-2 天；增量编译 15-30min/次 |
-| **总计** | **21-34** | **29-46** | **34-53 人天** | **v2 修正基于实际代码编译障碍和 API 精确核实** |
+| 任务 | 原估算 | v2 修正 | v3 收窄 | 修正理由 |
+|------|--------|--------|---------|---------|
+| RecordingCanvas 实现 | 8-12 | 15-22 | **12-17** | writePaint 从 500-800 行降至 200-350 行（排除 ImageFilter 15+ 子类递归） |
+| LayerRecorder 实现 | 5-8 | 6-10 | **5-8** | 仅采集 PictureLayer + SolidColorLayer + ScrollbarLayer（砍掉 Texture/Video/Surface） |
+| FrameAssembler 实现 | 3-5 | 3-5 | **3-4** | 无变化 |
+| Chromium 源码修改 | 2-4 | 4-6 | **3-5** | 减少拦截点（无需 Texture/Video/Surface 钩子） |
+| 编译 & 集成测试 | 3-5 | 6-10 | **5-8** | 测试页面减少（无 WebGL/Video/复杂特效页面） |
+| **总计** | **21-34** | **34-53** | **28-42 人天** | |
 
 **关键假设**：
 - 工程师已具备 Chromium C++ 开发经验（熟悉 `gn`/`ninja` 构建系统）
@@ -311,7 +355,7 @@ C++ 标准：  C++20（M143 全面迁移）
 | P0.4 | 确定 M143 bundled Skia 版本（`third_party/skia/README.chromium`） | 记录 Skia commit hash |
 | P0.5 | 确定对应的 CanvasKit npm 版本 | 验证 `canvaskit-wasm` 版本与 Skia 版本兼容 |
 
-#### Phase A：核心绘制拦截（15-22 人天）
+#### Phase A：核心绘制拦截（12-17 人天）
 
 **目标**：端到端渲染闭环 —— 简单网页（纯色背景 + 文本 + 图像）从 Chromium → CommandBuffer → 客户端 CanvasKit 渲染，结构化一致性校验通过（SSIM > 0.95，非像素级对比）。
 
@@ -450,7 +494,7 @@ void RecordingCanvas::onDrawPath(const SkPath& path, const SkPaint& paint) {
 | 函数 | 格式 | 预估行数 |
 |------|------|---------|
 | `writeRect` | l(f32) + t(f32) + r(f32) + b(f32) = 16B | 10 |
-| `writePaint` | 递归序列化 Paint 树（含 Shader/MaskFilter/ColorFilter/PathEffect/ImageFilter/Blender 子树） | 500-800 |
+| `writePaint` | 递归序列化 Paint 树（v3：仅基本属性 + 线性 GradientShader，排除 ImageFilter/Blender/复杂 Shader） | 200-350 |
 | `writePath` | verbCount(u32) + pointCount(u32) + verbs[u8*] + points[f32*] | 50 |
 | `writeTextBlob` | 遍历 glyph run，序列化 glyphs + positions + fonts | 100-150 |
 | `writeRRect` | type(u8) + rect(16B) + radii[4](32B) = 49B | 20 |
@@ -466,19 +510,18 @@ void RecordingCanvas::onDrawPath(const SkPath& path, const SkPaint& paint) {
 | `writeShadowRec` | shadowRec 结构序列化 |
 | `writeImageFilter` | 递归序列化 ImageFilter 树（SkImageFilter::serialize） |
 
-**`writePaint` 实现概览**（最复杂的序列化函数，**v2 修正：500-800 行**）：
+**`writePaint` 实现概览**（v3 收窄后：200-350 行，仅基本 Paint + 线性 GradientShader）：
 
 ```cpp
-// command_buffer.cpp — writePaint
-// 需要递归序列化整个 Paint 效果树：
-//   SkShader       — 7+ 子类 (Gradient/Image/PerlinNoise/...)
-//   SkMaskFilter   — 3 子类 (Blur/Table/Shader)
-//   SkColorFilter  — 6 子类 (Matrix/Table/Lighting/...)
-//   SkPathEffect   — 5 子类 (Dash/Corner/Sum/Compose/...)
-//   SkImageFilter  — 15+ 子类 (Blur/DropShadow/Matrix/Blend/...)
-//   SkBlender      — 自定义混合模式
-// 仅 writeImageFilter 递归树就可达 300+ 行
-// 复杂 Paint 序列化可达 1000+ 字节（含 Runtime Effect SkSL）
+// command_buffer.cpp — writePaint (v3 范围)
+// v3 仅处理基础 Paint 属性 + 线性渐变 Shader
+// 排除：ImageFilter 树（15+ 子类）、MaskFilter/ColorFilter/PathEffect/Blender
+// 遇到复杂 Paint → 降级为纯色填充 + 日志警告
+//
+// 范围内子类：
+//   SkGradientShader（仅线性，≤2 色停止）
+// 范围外处理：
+//   复杂 Shader/ImageFilter/MaskFilter → 忽略该效果，仅序列化基础颜色
 
 
 ```cpp
@@ -618,7 +661,7 @@ std::vector<uint8_t> FrameAssembler::assembleFrame(
 ✅ 5 个简单测试页面通过（纯色、渐变、文本、图像、混合）
 ```
 
-#### Phase B：全部绘制方法补齐（8-12 人天）
+#### Phase B：全部绘制方法补齐（8-14 人天）
 
 填充 RecordingCanvas 全部 28+ 虚函数覆盖 + 剩余序列化函数。
 
@@ -662,16 +705,18 @@ void RecordingCanvas::onDrawSlug(const SkSlug* slug, const SkPaint& paint) {
 }
 ```
 
-##### B3. 剩余 CommandBuffer 序列化函数（3-5 人天）
+##### B3. 剩余 CommandBuffer 序列化函数（2-3 人天）
 
-| 函数 | 内容 |
-|------|------|
-| `writeShader` | Gradient/Image/PerlinNoise/ColorFilter shader 递归 |
-| `writeMaskFilter` | Blur/Table/Shader mask filter |
-| `writeColorFilter` | Matrix/Table/Lighting/HighContrast color filter |
-| `writePathEffect` | Dash/Corner/Sum/Compose path effect |
-| `writeImageFilter` | Blur/DropShadow/Matrix/ColorFilter image filter |
-| `writeBlender` | Arithmetic blend 参数 |
+> **v3 收窄**：仅实现范围内的 Shader/Filter 子集。复杂效果降级为忽略。
+
+| 函数 | 内容 | v3 状态 |
+|------|------|---------|
+| `writeShader` | 仅线性 `SkGradientShader`（≤2 色停止） | ✅ 实现 |
+| `writeMaskFilter` | 跳过（忽略） | ❌ 降级 |
+| `writeColorFilter` | 跳过（忽略） | ❌ 降级 |
+| `writePathEffect` | Dash 效果 | ✅ 实现 |
+| `writeImageFilter` | 跳过（忽略）— 遇到复杂 filter → 降级为位图 | ❌ 降级 |
+| `writeBlender` | 跳过（仅处理 kSrcOver 默认） | ❌ 降级 |
 
 ##### B4. LayerRecorder + FrameAssembler 完整实现（2-3 人天）
 
@@ -762,15 +807,17 @@ void PictureLayerImpl::UpdateTiles() {
 }
 ```
 
-#### Phase C：非 PictureLayer 补齐（5-8 人天）
+#### Phase C：非 PictureLayer 补齐（2-3 人天）
 
-| 图层类型 | 采集方法 | 关键挑战 |
-|----------|---------|---------|
-| **SolidColorLayer** | 直接读取 `background_color()`，序列化为 `drawColor` | 无 |
-| **TextureLayer** | 需通过 `viz::TransferableResource` 获取 GPU 纹理 → CPU 回读 | GPU→CPU 回读延迟 ~5ms（需 PBO 异步） |
-| **VideoLayer** | 通过 `media::VideoFrame` → `SkImage` 转换 | 硬件解码帧的 GPU 内存映射 |
-| **SurfaceLayer** | 跨进程合成表面捕获，类似 TextureLayer | 跨进程内存安全 |
-| **ScrollbarLayer** | 采集位置 + thumb 大小 + 方向，客户端使用 CSS 渲染滚动条 | 样式一致性 |
+> **v3 收窄**：仅实现 SolidColorLayer + ScrollbarLayer。TextureLayer/VideoLayer/SurfaceLayer 排除。
+
+| 图层类型 | 采集方法 | 状态 |
+|----------|---------|------|
+| **SolidColorLayer** | 直接读取 `background_color()`，序列化为 `drawColor` | ✅ 范围内 |
+| **ScrollbarLayer** | 采集位置 + thumb 大小 + 方向，客户端使用 CSS 渲染 | ✅ 范围内 |
+| ~~TextureLayer~~ | ~~GPU 纹理 → CPU 回读~~ | ❌ v3 排除 |
+| ~~VideoLayer~~ | ~~`media::VideoFrame` → `SkImage`~~ | ❌ v3 排除 |
+| ~~SurfaceLayer~~ | ~~跨进程合成表面捕获~~ | ❌ v3 排除 |
 
 #### Phase D：安全加固（3-5 人天）
 
@@ -858,10 +905,9 @@ cc/BUILD.gn                           # +1 行（依赖 garnet）
 
 ```
 [ ] SolidColorLayer 采集正确
-[ ] TextureLayer GPU→CPU 回读可用
-[ ] VideoLayer 捕获可用或不丢失数据
-[ ] 滚动条位置精确同步
-[ ] 全量网页测试通过（含 WebGL、<video>、iframe）
+[ ] ScrollbarLayer 位置/方向同步精确
+[ ] TextureLayer/VideoLayer/SurfaceLayer — 降级为占位矩形（非崩溃）
+```
 ```
 
 ---
@@ -913,18 +959,18 @@ Phase B 关键路径：
   B2(onDrawSlug 验证) ∥ B3(序列化补齐) ∥ B1
 ```
 
-### 5.2 修正后总工期
+### 5.2 修正后总工期（v3 收窄）
 
 | 路径 | 串行人天 |
 |------|---------|
 | Phase 0 关键路径 | 3-5 天（npm 路径）/ 6-8 天（自编译路径） |
-| Phase A 关键路径 | 15-22 天 |
-| Phase B 关键路径 | 10-15 天 |
-| Phase C 关键路径 | 8-12 天 |
+| Phase A 关键路径 | 10-16 天 |
+| Phase B 关键路径 | 6-12 天 |
+| Phase C 关键路径 | 1-2 天（仅 SolidColorLayer + ScrollbarLayer） |
 | Phase D 关键路径 | 5-8 天 |
-| **总计（含并行优化）** | **34-53 人天** |
+| **总计（含并行优化）** | **28-42 人天** |
 
-> 1-2 名 C++ 工程师 + 1 名前端工程师，约 **5-8 周**。
+> 1-2 名 C++ 工程师 + 1 名前端工程师，约 **4-6 周**。
 
 ---
 
@@ -1006,36 +1052,47 @@ Phase B 关键路径：
 
 ## 九、总结
 
-### 原方案审计结论（v2 修正后）
+### 审计迭代历程
 
-| 维度 | 原评估 | v1 审计修正 | v2 再修正 | 关键差异 |
-|------|--------|-----------|----------|---------|
-| 技术可行性 | 中等 | 中等→偏高 | 中等→偏高 | v2 修正了 OOP-R 进程模型（无需 DeepCopy），降低了复杂性 |
-| 技术风险 | 高 | 高（重排序） | 高（onDrawSlug 降级） | onDrawSlug 从 HIGH→MEDIUM；SkPicture 复用方案作为新选择 |
-| 工作量 | 21-34 人天 | 29-46 人天 | **34-53 人天** | v2 加入 includes 恢复 + override 修正 + writePaint 500-800 行 + CanvasKit 版本匹配 |
-| 代码复用度 | 隐含 100% | ~45% | **~30-35%** | v2 核算更精确：recording_canvas.cpp/layer_recorder.cpp/garnet_interceptor 均从零创建 |
-| 替代方案 | 3 个 | 5 个 | 6 个（+SkPicture 复用） | 新增 SkPicture::MakeFromData 路径（建议 1 周 PoC） |
-| 生产可行性 | 不可生产 | 不可生产（9 项 MVP） | 不可生产（9 项 MVP + 增量渲染前置） | 增量渲染从 Phase 4 提升至 Phase A；废弃 pixelmatch |
+| 版本 | 工作量 | 关键变化 |
+|------|--------|---------|
+| v0 原方案 | 21-34 人天 | 乐观估计，未识别实际的代码完整度 |
+| v1 初版审计 | 29-46 人天 | 增加 M143 适配、Slug 处理、OOP DeepCopy |
+| v2 两份审计修正 | 34-53 人天 | 修正 4 个事实性错误 + writePaint 500-800 行 + 增量渲染前置 |
+| **v3 范围收窄** | **28-42 人天** | 排除媒体/特效/3D → writePaint 降至 200-350 行 + Phase C 砍掉 3/5 |
 
-### 两份独立审计的综合采纳
+### v3 MVP 交付范围
 
-| 来源 | 采纳项 | 讨论/推迟项 |
-|------|--------|-----------|
-| **架构级审计** | 废弃 pixelmatch、增量渲染前移、SkSlug 不降级、ImageFilter 降级为位图 | 混合渲染管线→v2.0；SkPicture 复用→独立 PoC |
-| **代码级审计** | 4 个事实性错误修正、writePaint 500-800 行、完整度 30-35%、assembleFrame bug 修正、AppendQuads→UpdateTiles | Phase 0 工期保持 3-5 天（npm 路径） |
+```
+✅ 范围内：
+   DOM 基础绘制（Rect/RRect/Oval/简单 Path）
+   纯色 + 简单线性渐变
+   所有文本（SkTextBlob）
+   基础 PNG/JPEG 图像
+   图层变换 + 裁剪
+   SolidColorLayer + ScrollbarLayer
+   增量渲染（Dirty Rects）
+
+❌ 范围外：
+   MP4/WebP/AVIF/MP3/SVG 复杂路径
+   WebGL/WebGPU/Canvas 2D TextureLayer
+   backdrop-filter/blur/drop-shadow/复杂混合模式
+   radial-gradient/conic-gradient/Runtime Shader
+   VideoLayer/SurfaceLayer
+```
 
 ### 推荐执行路径
 
 ```
-Phase 0 (3-5d) ───→ Phase A (15-22d) ───→ 可演示 MVP
+Phase 0 (3-5d) ───→ Phase A (10-16d) ───→ 可演示 MVP
            npm 路径       含增量渲染                            
                          
 SkPicture PoC (1 周，独立并行)
 
-Phase B (10-15d) → 完整绘制覆盖 → Phase C (8-12d) → 全图层类型 → Phase D (5-8d) → 生产加固
+Phase B (6-12d) → 完整绘制覆盖 → Phase C (1-2d) → 非 PictureLayer → Phase D (5-8d) → 生产加固
 ```
 
-**总工期**: 34-53 人天（1-2 名 C++ 工程师 + 1 名前端工程师，约 5-8 周）
+**总工期**: 28-42 人天（1-2 名 C++ 工程师 + 1 名前端工程师，约 4-6 周）
 
 ---
 
