@@ -38,6 +38,32 @@
 #include <new>
 #include <stdexcept>
 
+// Skia 实际头文件路径 (Chromium 源码树):
+//   挂载路径: third_party/skia/include/
+//   序列化所需的完整类型定义（非前向声明）
+#include "include/core/SkRect.h"
+#include "include/core/SkRRect.h"
+#include "include/core/SkPoint.h"
+#include "include/core/SkM44.h"
+#include "include/core/SkPath.h"
+#include "include/core/SkTextBlob.h"
+#include "include/core/SkVertices.h"
+#include "include/core/SkPaint.h"
+#include "include/core/SkPathEffect.h"
+#include "include/core/SkShader.h"
+#include "include/core/SkImage.h"
+#include "include/core/SkData.h"
+#include "include/core/SkPixmap.h"
+#include "include/core/SkSamplingOptions.h"
+#include "include/core/SkDrawShadowRec.h"
+#include "include/core/SkColorPriv.h"       // SkColorGetA, SkColorGetR, etc.
+#include "include/encode/SkEncodedImageFormat.h"
+
+// SHA-256: 优先使用 Chromium 内置 BoringSSL，回退到 OpenSSL 或 DJB2
+#if defined(USE_BORINGSSL) || defined(USE_OPENSSL)
+#include <openssl/sha.h>
+#endif
+
 namespace garnet {
 
 // ═══════════════════════════════════════════════════════════════
@@ -420,28 +446,214 @@ void CommandBuffer::padToAlignment(size_t alignment) {
 // 此处仅保留 image 序列化的完整实现（因涉及图像槽位管理）。
 // ═══════════════════════════════════════════════════════════════
 
-/// @brief 序列化 SkPaint (§4.1.3 格式)。
+/// @brief 序列化 SkPaint (v4 MVP: 基础属性 + 线性渐变 Shader + Dash PathEffect)
 ///
-/// 序列化格式:
-///   color(4B) + blendMode(1B) + style(1B) + strokeWidth(f32) +
-///   strokeMiter(f32) + strokeCap(1B) + strokeJoin(1B) + antiAlias(1B) +
-///   hasShader(1B) + hasMaskFilter(1B) + hasColorFilter(1B) +
-///   hasPathEffect(1B) + hasImageFilter(1B)
-/// 若有 shader/filter 则递归序列化（简单 Paint ~8B, 复杂 Paint 101-301B）。
-void CommandBuffer::writePaint(const SkPaint&) {
-    // 由 RecordingCanvas 内部实现 SkPaint 序列化。
-    // 详见设计文档 §4.1.3。
+/// v4 SCOPE (BASIC ONLY, ~220 lines):
+///   Fixed fields: color4f(16B) + blendMode(u8) + style(u8) + strokeWidth(f32) +
+///                 strokeMiter(f32) + strokeCap(u8) + strokeJoin(u8) + antiAlias(u8)
+///   Shader: only linear gradient (≤2 stops). Non-gradient → skip.
+///   Effects: only Dash path effect. MaskFilter/ColorFilter/ImageFilter → always 0.
+///   Blender: always 0 (kSrcOver default).
+///
+/// Style encoding: 0=Fill, 1=Stroke, 2=Hair (stroke + strokeWidth==0)
+void CommandBuffer::writePaint(const SkPaint& paint) {
+    // ── Fixed fields ──────────────────────────────────────────────
+
+    // Color (16B: r,g,b,a as f32)
+    writeColor4f(paint.getColor4f());
+
+    // BlendMode (u8)
+    writeU8(static_cast<uint8_t>(paint.getBlendMode_or(SkBlendMode::kSrcOver)));
+
+    // Style (u8): 0=Fill, 1=Stroke, 2=Hair
+    {
+        uint8_t style;
+        switch (paint.getStyle()) {
+            case SkPaint::kFill_Style:
+                style = 0;  // Fill
+                break;
+            case SkPaint::kStroke_Style:
+                // Hair: stroke width == 0 with stroke style
+                style = (paint.getStrokeWidth() == 0.0f) ? 2 : 1;
+                break;
+            case SkPaint::kStrokeAndFill_Style:
+                style = 1;  // Treat StrokeAndFill as Stroke (MVP simplification)
+                break;
+            default:
+                style = 0;  // Fallback
+                break;
+        }
+        writeU8(style);
+    }
+
+    writeF32(paint.getStrokeWidth());
+    writeF32(paint.getStrokeMiter());
+    writeU8(static_cast<uint8_t>(paint.getStrokeCap()));
+    writeU8(static_cast<uint8_t>(paint.getStrokeJoin()));
+    writeU8(paint.isAntiAlias() ? 1 : 0);
+
+    // ── Shader ────────────────────────────────────────────────────
+    // v4 MVP: only linear gradient (≤2 stops). All other shaders → skip.
+    {
+        sk_sp<SkShader> shader = paint.refShader();
+        if (shader) {
+            // Try to extract gradient info using asAGradient
+            SkColor      colors[16];
+            SkScalar     offsets[16];
+            SkShader::GradientInfo gradInfo;
+            gradInfo.fColors        = colors;
+            gradInfo.fColorOffsets  = offsets;
+            gradInfo.fColorCount    = 16;   // Up to 16 stops (MVP uses ≤2)
+            int actualStops = shader->asAGradient(&gradInfo);
+
+            if (actualStops > 0 && actualStops <= 16) {
+                // Linear gradient: type=0
+                writeU8(1);  // hasShader
+                writeU8(0);  // shaderType = LINEAR
+
+                // startPoint + endPoint (16B total)
+                writeF32(gradInfo.fPoint[0].x());
+                writeF32(gradInfo.fPoint[0].y());
+                writeF32(gradInfo.fPoint[1].x());
+                writeF32(gradInfo.fPoint[1].y());
+
+                // tileMode (u8)
+                writeU8(static_cast<uint8_t>(gradInfo.fTileMode));
+
+                // colorStopCount (u32) + [stopPos(f32) + color(16B)]*
+                writeU32(static_cast<uint32_t>(actualStops));
+                for (int i = 0; i < actualStops; ++i) {
+                    writeF32(gradInfo.fColorOffsets[i]);
+                    // Convert SkColor (u32 ARGB) → SkColor4f → writeColor4f
+                    SkColor4f stopColor = SkColor4f::FromColor(gradInfo.fColors[i]);
+                    writeColor4f(stopColor);
+                }
+            } else {
+                // Non-gradient or unsupported shader → skip (degrade to solid color)
+                writeU8(0);  // hasShader = false
+            }
+        } else {
+            writeU8(0);  // hasShader = false
+        }
+    }
+
+    // ── Effects (v4 MVP: exclude MaskFilter / ColorFilter / ImageFilter) ──
+    writeU8(0);  // hasMaskFilter  = 0 (always, MVP scope)
+    writeU8(0);  // hasColorFilter = 0 (always, MVP scope)
+
+    // PathEffect: only Dash (type=0) supported
+    {
+        sk_sp<SkPathEffect> pe = paint.refPathEffect();
+        if (pe) {
+            // First call: get interval count
+            SkPathEffect::DashInfo dashInfo;
+            pe->asADash(&dashInfo);  // Fills fCount when fIntervals==nullptr
+
+            if (dashInfo.fCount > 0) {
+                // Second call: get intervals and phase
+                std::vector<SkScalar> intervals(dashInfo.fCount);
+                dashInfo.fIntervals = intervals.data();
+                pe->asADash(&dashInfo);
+
+                writeU8(1);  // hasPathEffect
+                writeU8(0);  // type = DASH
+
+                writeU32(static_cast<uint32_t>(dashInfo.fCount));
+                for (int32_t i = 0; i < dashInfo.fCount; ++i) {
+                    writeF32(dashInfo.fIntervals[i]);
+                }
+                writeF32(dashInfo.fPhase);
+            } else {
+                // Not a dash effect → skip
+                writeU8(0);  // hasPathEffect = false
+            }
+        } else {
+            writeU8(0);  // hasPathEffect = false
+        }
+    }
+
+    writeU8(0);  // hasImageFilter = 0 (always, MVP scope)
+
+    // hasBlender: always 0 (use kSrcOver default)
+    writeU8(0);
 }
 
-void CommandBuffer::writePath(const SkPath&) {
-    // 序列化格式: verbCount(u32) + pointCount(u32) + verbs[] + points[]
-    // verb 使用 SkPath::Verb 枚举值 (0=move, 1=line, 2=quad, 3=conic, 4=cubic, 5=close)
-    // 边界检查: verbCount ≤ kMaxPathVerbs (100000), pointCount ≤ kMaxPathVerbs
+void CommandBuffer::writePath(const SkPath& path) {
+    // Format: verbCount(u32) + pointCount(u32) + verbs[u8*] + points[f32*]
+    // Verb values: 0=move, 1=line, 2=quad, 3=conic, 4=cubic, 5=close
+    int verbCount = path.countVerbs();
+    int pointCount = path.countPoints();
+
+    // Bounds check (§8.4 深度校验): verbCount/pointCount ≤ kMaxPathVerbs
+    if (static_cast<uint32_t>(verbCount) > kMaxPathVerbs ||
+        static_cast<uint32_t>(pointCount) > kMaxPathVerbs) {
+        return;  // Degrade: skip oversized path (avoid OOM)
+    }
+
+    writeU32(static_cast<uint32_t>(verbCount));
+    writeU32(static_cast<uint32_t>(pointCount));
+
+    // Write verbs
+    if (verbCount > 0) {
+        std::vector<uint8_t> verbs(verbCount);
+        path.getVerbs(verbs.data(), verbCount);
+        writeBlob(verbs.data(), verbCount);
+    }
+
+    // Write points
+    if (pointCount > 0) {
+        std::vector<SkPoint> points(pointCount);
+        path.getPoints(points.data(), pointCount);
+        for (int i = 0; i < pointCount; ++i) {
+            writeF32(points[i].x());
+            writeF32(points[i].y());
+        }
+    }
 }
 
-void CommandBuffer::writeTextBlob(const SkTextBlob*) {
-    // 序列化格式: glyphCount(u32) + pos[],glyphs[] + font_id(u32)
-    // 边界检查: glyphCount ≤ kMaxTextBlobGlyphs (50000)
+void CommandBuffer::writeTextBlob(const SkTextBlob* blob) {
+    // nullptr safe guard
+    if (!blob) return;
+
+    // First pass: count total glyphs and runs for bounds check
+    uint32_t runCount = 0;
+    uint32_t totalGlyphs = 0;
+    {
+        SkTextBlob::Iter iter(*blob);
+        SkTextBlob::Iter::Run run;
+        while (iter.next(&run)) {
+            runCount++;
+            totalGlyphs += run.fGlyphCount;
+        }
+    }
+
+    // Bounds check: totalGlyphs ≤ kMaxTextBlobGlyphs
+    if (totalGlyphs > kMaxTextBlobGlyphs) {
+        return;  // Degrade: skip oversized text blob
+    }
+
+    writeU32(runCount);
+
+    // Second pass: write each run
+    SkTextBlob::Iter iter(*blob);
+    SkTextBlob::Iter::Run run;
+    while (iter.next(&run)) {
+        // fontId: use typeface uniqueID (0 if no typeface)
+        uint32_t fontId = run.fFont ? run.fFont->uniqueID() : 0;
+        writeU32(fontId);
+        writeU32(static_cast<uint32_t>(run.fGlyphCount));
+
+        // Write glyphs (u16 array)
+        for (int i = 0; i < run.fGlyphCount; ++i) {
+            writeU16(run.fGlyphIndices[i]);
+        }
+
+        // Write positions (f32 × 2 per glyph)
+        for (int i = 0; i < run.fGlyphCount; ++i) {
+            writeF32(run.fPos[i].x());
+            writeF32(run.fPos[i].y());
+        }
+    }
 }
 
 /// @brief 序列化图像引用（完整实现，涉及图像槽位管理）。
@@ -489,40 +701,147 @@ void CommandBuffer::writeImage(const SkImage* image) {
     }
 }
 
-void CommandBuffer::writeSamplingOptions(const SkSamplingOptions&) {
-    // 序列化格式: useCubic(1B) + [cubic B(f32)+C(f32)] | [filter(1B)+mipmap(1B)]
+void CommandBuffer::writeSamplingOptions(const SkSamplingOptions& s) {
+    // Write useCubic(u8). If cubic: B(f32)+C(f32). Else: filter(u8)+mipmap(u8).
+    // Check anisotropy first.
+    if (s.isAniso()) {
+        // Anisotropic sampling: encode as cubic with special flag or as filter=aniso
+        // For MVP, treat anisotropy by writing useCubic=0 and filter=aniso
+        writeU8(0);  // useCubic = false
+        writeU8(static_cast<uint8_t>(s.filter));
+        writeU8(static_cast<uint8_t>(s.mipmap));
+    } else if (s.useCubic) {
+        writeU8(1);  // useCubic = true
+        writeF32(s.cubic.B);
+        writeF32(s.cubic.C);
+    } else {
+        writeU8(0);  // useCubic = false
+        writeU8(static_cast<uint8_t>(s.filter));
+        writeU8(static_cast<uint8_t>(s.mipmap));
+    }
 }
 
-void CommandBuffer::writeVertices(const SkVertices*) {
-    // 序列化格式: vertexMode(1B) + vertexCount(u32) + indexCount(u32) +
-    //   hasTexs(1B) + hasColors(1B) + positions[f32*] + texCoords[f32*] +
-    //   colors[4B*] + indices[u16*]
-    // 边界检查: vertexCount ≤ kMaxVerticesCount (100000)
+void CommandBuffer::writeVertices(const SkVertices* v) {
+    // nullptr safe guard
+    if (!v) return;
+
+    int vCount = v->vertexCount();
+    int iCount = v->indexCount();
+
+    // Bounds check: vertexCount ≤ kMaxVerticesCount
+    if (static_cast<uint32_t>(vCount) > kMaxVerticesCount) {
+        return;  // Degrade: skip oversized vertices
+    }
+
+    // vertexMode(u8): 0=Triangles, 1=TriangleStrip, 2=TriangleFan
+    writeU8(static_cast<uint8_t>(v->mode()));   // SkVertices::VertexMode maps directly
+    writeU32(static_cast<uint32_t>(vCount));
+    writeU32(static_cast<uint32_t>(iCount));
+    writeU8(v->hasTexCoords() ? 1 : 0);
+    writeU8(v->hasColors() ? 1 : 0);
+
+    // Positions: f32 × vertexCount × 2
+    const SkPoint* pos = v->positions();
+    for (int i = 0; i < vCount; ++i) {
+        writeF32(pos[i].x());
+        writeF32(pos[i].y());
+    }
+
+    // TexCoords (if present): f32 × vertexCount × 2
+    if (v->hasTexCoords()) {
+        const SkPoint* tex = v->texCoords();
+        for (int i = 0; i < vCount; ++i) {
+            writeF32(tex[i].x());
+            writeF32(tex[i].y());
+        }
+    }
+
+    // Colors (if present): u8 × vertexCount × 4 (RGBA)
+    if (v->hasColors()) {
+        const SkColor* colors = v->colors();
+        for (int i = 0; i < vCount; ++i) {
+            SkColor c = colors[i];
+            writeU8(SkColorGetR(c));
+            writeU8(SkColorGetG(c));
+            writeU8(SkColorGetB(c));
+            writeU8(SkColorGetA(c));
+        }
+    }
+
+    // Indices: u16 × indexCount
+    if (iCount > 0) {
+        const uint16_t* indices = v->indices();
+        for (int i = 0; i < iCount; ++i) {
+            writeU16(indices[i]);
+        }
+    }
 }
 
-void CommandBuffer::writeRect(const SkRect&) {
-    // left(f32) + top(f32) + right(f32) + bottom(f32) = 16 bytes
+void CommandBuffer::writeRect(const SkRect& r) {
+    // left(f32) + top(f32) + right(f32) + bottom(f32) = 16 bytes LE
+    writeF32(r.left());
+    writeF32(r.top());
+    writeF32(r.right());
+    writeF32(r.bottom());
 }
 
-void CommandBuffer::writeRRect(const SkRRect&) {
-    // type(1B) + rect(16B) + radii[4](32B) = 49 bytes
+void CommandBuffer::writeRRect(const SkRRect& r) {
+    // type(u8) + rect(16B, use writeRect) + 4 radii(4×8B=32B) = 49 bytes
+    // SkRRect::Type: 0=Empty,1=Rect,2=Oval,3=Simple,4=NinePatch,5=Complex
+    writeU8(static_cast<uint8_t>(r.type()));
+    writeRect(r.rect());
+    // Write all 4 corner radii (each corner: x(f32) + y(f32))
+    // Works uniformly for all types (Empty/Rect→0, Oval→w/2,h/2, Simple→same×4, Complex→unique)
+    static constexpr SkRRect::Corner kCorners[4] = {
+        SkRRect::kUpperLeft_Corner, SkRRect::kUpperRight_Corner,
+        SkRRect::kLowerRight_Corner, SkRRect::kLowerLeft_Corner
+    };
+    for (int i = 0; i < 4; ++i) {
+        SkVector rad = r.radii(kCorners[i]);
+        writeF32(rad.x());
+        writeF32(rad.y());
+    }
 }
 
-void CommandBuffer::writePoint(const SkPoint&) {
+void CommandBuffer::writePoint(const SkPoint& p) {
     // x(f32) + y(f32) = 8 bytes
+    writeF32(p.x());
+    writeF32(p.y());
 }
 
-void CommandBuffer::writeColor4f(const SkColor4f&) {
+void CommandBuffer::writeColor4f(const SkColor4f& c) {
     // r(f32) + g(f32) + b(f32) + a(f32) = 16 bytes
+    writeF32(c.fR);
+    writeF32(c.fG);
+    writeF32(c.fB);
+    writeF32(c.fA);
 }
 
-void CommandBuffer::writeShadowRec(const SkDrawShadowRec&) {
-    // 由 RecordingCanvas 内部实现
+void CommandBuffer::writeShadowRec(const SkDrawShadowRec& rec) {
+    // fZPlaneX(f32) + fZPlaneY(f32) + fZPlaneZ(f32) +
+    // fLightPosX(f32) + fLightPosY(f32) + fLightPosZ(f32) +
+    // fLightRadius(f32) + fAmbientAlpha(f32) + fSpotAlpha(f32) + fFlags(u32)
+    // = 40 bytes
+    writeF32(rec.fZPlaneParams.fX);
+    writeF32(rec.fZPlaneParams.fY);
+    writeF32(rec.fZPlaneParams.fZ);
+    writeF32(rec.fLightPos.fX);
+    writeF32(rec.fLightPos.fY);
+    writeF32(rec.fLightPos.fZ);
+    writeF32(rec.fLightRadius);
+    // Extract alpha from SkColor (ARGB → alpha only)
+    writeF32(static_cast<float>(SkColorGetA(rec.fAmbientColor)) / 255.0f);
+    writeF32(static_cast<float>(SkColorGetA(rec.fSpotColor)) / 255.0f);
+    writeU32(rec.fFlags);
 }
 
-void CommandBuffer::writeM44(const SkM44&) {
-    // 4×4 矩阵 = 16 × f32 = 64 bytes (v1.6 新增, opcode 0x14)
-    // 行主序 (row-major)，支持 CSS transform: matrix3d
+void CommandBuffer::writeM44(const SkM44& m) {
+    // 4×4 矩阵 = 16 × f32 = 64 bytes, row-major (行主序)
+    for (int r = 0; r < 4; ++r) {
+        for (int c = 0; c < 4; ++c) {
+            writeF32(m.rc(r, c));
+        }
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -573,11 +892,12 @@ void CommandBuffer::encodePendingImages() {
             slot.encoded = true;
             continue;
         }
-        // TODO: 实际编码由 Skia API 完成
-        // sk_sp<SkData> encoded = slot.image->encodeToData(SkEncodedImageFormat::kPNG, 85);
-        // if (encoded) {
-        //     slot.data.assign(encoded->bytes(), encoded->bytes() + encoded->size());
-        // }
+        // 实际编码: PNG 无损编码（PNG 忽略 quality 参数，但需要传递以兼容 API）
+        sk_sp<SkData> encoded = slot.image->encodeToData(SkEncodedImageFormat::kPNG, 100);
+        if (encoded && encoded->size() > 0) {
+            const uint8_t* src = static_cast<const uint8_t*>(encoded->data());
+            slot.data.assign(src, src + encoded->size());
+        }
         slot.encoded = true;
     }
 }
@@ -624,12 +944,80 @@ void CommandBuffer::clear() {
 /// 安全: 使用完整 256-bit 输出（非截断），防止碰撞攻击。
 /// 256-bit 空间的生日界约为 2^128 次操作，计算上不可行。
 ///
+/// 实现策略（按优先级）:
+///   1. BoringSSL/OpenSSL: SHA256() 对像素数据直接哈希（最快）
+///   2. Fallback: DJB2 哈希（非密码安全，但可用于图像去重）
+///
 /// @param image Skia 图像（通过 peekPixels 获取像素数据后哈希）
 /// @returns 32 字节 SHA-256 哈希
-/// @note 当前 stub 返回零哈希，实际实现需链接 OpenSSL/BoringSSL
-static CommandBuffer::ImageHash ComputeImageSHA256(const SkImage*) {
+/// @note 哈希输入为像素原始字节，非编码后数据，避免编码开销
+static CommandBuffer::ImageHash ComputeImageSHA256(const SkImage* image) {
     CommandBuffer::ImageHash hash{};
+
+    if (!image) {
+        std::memset(hash.bytes, 0, 32);
+        return hash;
+    }
+
+#if defined(USE_BORINGSSL) || defined(USE_OPENSSL)
+    // ── BoringSSL / OpenSSL path ──────────────────────────────────
+    SkPixmap pixmap;
+    if (image->peekPixels(&pixmap)) {
+        // 光栅图像: 直接哈希像素数据
+        SHA256(static_cast<const uint8_t*>(pixmap.addr()),
+               pixmap.computeByteSize(),
+               hash.bytes);
+    } else {
+        // 非光栅图像 (GPU-backed / lazy): 通过 PNG 编码获取字节
+        sk_sp<SkData> encoded = image->encodeToData(SkEncodedImageFormat::kPNG, 100);
+        if (encoded && encoded->size() > 0) {
+            SHA256(static_cast<const uint8_t*>(encoded->data()),
+                   encoded->size(),
+                   hash.bytes);
+        } else {
+            std::memset(hash.bytes, 0, 32);
+        }
+    }
+#else
+    // ── Fallback: DJB2 hash (非密码安全，用于图像去重) ────────────
+    // DJB2: hash = hash * 33 + byte
+    // 将 64-bit 哈希扩展为 32 字节（填充低 8 字节，其余置零）
+    uint64_t djb2 = 5381;
+
+    SkPixmap pixmap;
+    if (image->peekPixels(&pixmap)) {
+        const uint8_t* data = static_cast<const uint8_t*>(pixmap.addr());
+        size_t len = pixmap.computeByteSize();
+        // 对像素数据取样哈希（每 64 字节取 1 字节，避免大图像开销过大）
+        size_t step = std::max<size_t>(1, len / 4096);
+        for (size_t i = 0; i < len; i += step) {
+            djb2 = ((djb2 << 5) + djb2) + data[i];  // djb2 * 33 + byte
+        }
+    } else {
+        // 非光栅图像: 编码为 PNG 后取样哈希
+        sk_sp<SkData> encoded = image->encodeToData(SkEncodedImageFormat::kPNG, 100);
+        if (encoded && encoded->size() > 0) {
+            const uint8_t* data = static_cast<const uint8_t*>(encoded->data());
+            size_t len = encoded->size();
+            size_t step = std::max<size_t>(1, len / 4096);
+            for (size_t i = 0; i < len; i += step) {
+                djb2 = ((djb2 << 5) + djb2) + data[i];
+            }
+        }
+    }
+
+    // 将 DJB2 64-bit 哈希写入 bytes[0..7]，其余置零
     std::memset(hash.bytes, 0, 32);
+    hash.bytes[0] = static_cast<uint8_t>(djb2 & 0xFF);
+    hash.bytes[1] = static_cast<uint8_t>((djb2 >> 8) & 0xFF);
+    hash.bytes[2] = static_cast<uint8_t>((djb2 >> 16) & 0xFF);
+    hash.bytes[3] = static_cast<uint8_t>((djb2 >> 24) & 0xFF);
+    hash.bytes[4] = static_cast<uint8_t>((djb2 >> 32) & 0xFF);
+    hash.bytes[5] = static_cast<uint8_t>((djb2 >> 40) & 0xFF);
+    hash.bytes[6] = static_cast<uint8_t>((djb2 >> 48) & 0xFF);
+    hash.bytes[7] = static_cast<uint8_t>((djb2 >> 56) & 0xFF);
+#endif
+
     return hash;
 }
 
