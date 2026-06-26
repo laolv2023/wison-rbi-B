@@ -1,9 +1,9 @@
-# Wison-RBI C++ Compositor 拦截层：全量审计与生产级实现方案（v3 范围收窄版）
+# Wison-RBI C++ Compositor 拦截层：全量审计与生产级实现方案（v4 一致性修正版）
 
 > **审计对象**: R18-CRITICAL 可行性评估方案（原始评估）  
 > **目标版本**: Chromium 143.0.7499.192-1 (Stable: 2025-12-02)  
 > **初版日期**: 2026-06-26  
-> **修正日期**: 2026-06-26（v2：两份独立审计 / v3：MVP 范围收窄）  
+> **修正日期**: 2026-06-26（v2：两份独立审计 / v3：MVP 范围收窄 / v4：内部一致性修正）  
 > **角色**: 系统架构师 / 资深浏览器专家 / 资深 C++ 开发工程师  
 > 
 > **v2 修正来源**：
@@ -11,6 +11,8 @@
 > - 代码级审核（资深 C++ 审查）：发现 4 个事实性错误、3 个方法论缺陷、3 个技术方案缺陷
 > 
 > **v3 范围收窄**：明确 MVP 仅覆盖"基础 UI 与文本"，排除"网络媒体"和"复杂特效/3D"。
+> 
+> **v4 一致性修正**：内部审计发现 3 处数值矛盾（关键路径）、DeepCopy 残留清理、SkSlug 评级统一、降级策略定义、内存预算补全、伪代码签名修正。
 
 ---
 
@@ -104,7 +106,7 @@ Phase B 工期缩短：
 | 风险项 | 原方案评估 | 审计修正 |
 |--------|-----------|---------|
 | PaintOp 枚举变更 | 仅提"M120-M130 变动" | M143 新增 `DrawSlugOp`、`DrawMeshOp`，需显式处理 |
-| OOP 光栅化影响 | 注释提及，未量化 | 增加 Lock+DeepCopy 延迟 0.5-2ms/layer |
+| OOP 光栅化影响 | 注释提及，未量化 | PaintOpBuffer Finalize 后不可变，跨线程只读安全，无需 DeepCopy |
 | PaintOpBufferSerializer 参考 | 提及"可作参考" | 已模板化，直接复用需要适配 Chromium 内存模型 |
 
 #### 路径 B 审计（SkCanvas 子类化拦截）
@@ -246,7 +248,7 @@ SHA-256 哈希:                                             0%  ❌
   3. 实现 SHA-256 哈希（链接 BoringSSL/OpenSSL）
   4. 实现图像编码（Skia encodeToData + Worker 线程异步）
   5. 实现 RecordingCanvas 工厂方法 Create() + 基类构造
-  6. 实现 LayerRecorder::recordPictureLayer（含 OOP 光栅化 DeepCopy）
+  6. 实现 LayerRecorder::recordPictureLayer（含 OOP-R 兼容处理：PaintOpBuffer 只读访问）
   7. 实现 FrameAssembler::assembleFrame
   8. 修改 2 个 Chromium 文件（picture_layer_impl.cc + layer_tree_host_impl.cc）
   9. 字体/布局/主色调结构化一致性验证套件（SSIM > 0.95）
@@ -273,7 +275,7 @@ M143 已发布 ~7 个月，API 冻结，适合作为实现基线。
 
 | 变更 | 影响 | 处理方式 |
 |------|------|---------|
-| **Skia Slug 文本渲染**（m127+ 引入，m143 稳定） | `SkCanvas::onDrawSlug` 新虚函数 | RecordingCanvas 必须覆盖，序列化 `SkSlug` → `SkTextBlob` 转换 |
+| **Skia Slug 文本渲染**（m127+ 引入，m143 稳定） | `SkCanvas::onDrawSlug` 新虚函数 | 需验证 M143 Compositor 是否触发 Slug 路径；若触发则必须覆盖，若不触发则可跳过 |
 | **CSS 锚定定位**（`@container anchored`） | 图层变换矩阵在 DrawLayers 之间可能变化 | 已在 LayerRecorder 设计中通过 `DrawLayers` 时刻捕获变换来处理 |
 | **WebGPU 更新** | `TextureLayer` 可能承载 WebGPU 渲染结果 | WebGPU 纹理捕获路径需验证 |
 | **推测性预渲染**（Speculation Rules eager） | 额外的导航可能产生额外图层 | 不影响单帧管道 |
@@ -350,7 +352,7 @@ C++ 标准：  C++20（M143 全面迁移）
 | 任务 | 内容 | 验证标准 |
 |------|------|---------|
 | P0.1 | Chromium M143 源码 checkout + 首次编译 | `out/Default/chrome --headless=new --no-sandbox https://example.com --dump-dom` 正常输出 |
-| P0.2 | 创建 `//garnet/` 目录，编写 `BUILD.gn` | `ninja -C out/Default garnet` 通过编译 |
+| P0.2 | 创建 `//garnet/` 目录，编写 `BUILD.gn`（含 GN 依赖：`//cc`, `//cc/paint`, `//skia`, `//third_party/boringssl`） | `ninja -C out/Default garnet` 通过编译 |
 | P0.3 | 修改 `cc/layers/picture_layer_impl.cc`，插入 Garnet 钩子（仅日志） | Chromium 启动日志中出现 Garnet 标记 |
 | P0.4 | 确定 M143 bundled Skia 版本（`third_party/skia/README.chromium`） | 记录 Skia commit hash |
 | P0.5 | 确定对应的 CanvasKit npm 版本 | 验证 `canvaskit-wasm` 版本与 Skia 版本兼容 |
@@ -590,8 +592,9 @@ void CommandBuffer::encodePendingImages() {
         if (!slot.image) continue;
         
         // Skia encodeToData — 在 Worker 线程调用（可能阻塞 10-50ms）
+        // v4 修正：PNG 不接受质量参数（无损编码）；如需控制体积用 JPEG
         sk_sp<SkData> encoded = slot.image->encodeToData(
-            SkEncodedImageFormat::kPNG, 85);  // quality 85
+            SkEncodedImageFormat::kPNG);  // PNG 无损编码
         
         if (encoded && encoded->size() > 0) {
             slot.data.assign(
@@ -687,8 +690,8 @@ std::vector<uint8_t> FrameAssembler::assembleFrame(
 ##### B2. `onDrawSlug` 处理（M143 特殊 — 1-2 人天）
 
 ```cpp
-// recording_canvas.cpp — M143 关键新增
-void RecordingCanvas::onDrawSlug(const SkSlug* slug, const SkPaint& paint) {
+// recording_canvas.cpp — v4 修正签名：SkSlug 内部已吸收 SkPaint
+void RecordingCanvas::onDrawSlug(const SkSlug* slug) {
     if (!recording_ || !slug) return;
     
     // SkSlug 是 Skia 内部的文本布局快照，不可直接序列化
@@ -697,11 +700,12 @@ void RecordingCanvas::onDrawSlug(const SkSlug* slug, const SkPaint& paint) {
     // 方案 1：如果 SkSlug 提供了 toTextBlob() API
     sk_sp<SkTextBlob> blob = slug->toTextBlob();
     if (blob) {
-        this->onDrawTextBlob(blob.get(), 0, 0, paint);
+        const SkPaint defaultPaint;  // Slug 内已含 paint 属性
+        this->onDrawTextBlob(blob.get(), 0, 0, defaultPaint);
     }
     
-    // 方案 2：降级到 SkDrawable 处理（序列化为 noop）
-    // [I] 具体 API 需查看 M143 的 SkSlug 头文件
+    // 方案 2：降级 — 序列化为 noop（需验证 M143 是否实际触发此路径）
+    // [U] SkSlug API 需查看 M143 的 include/core/SkSlug.h 确认 toTextBlob() 是否存在
 }
 ```
 
@@ -709,16 +713,18 @@ void RecordingCanvas::onDrawSlug(const SkSlug* slug, const SkPaint& paint) {
 
 > **v3 收窄**：仅实现范围内的 Shader/Filter 子集。复杂效果降级为忽略。
 
-| 函数 | 内容 | v3 状态 |
-|------|------|---------|
-| `writeShader` | 仅线性 `SkGradientShader`（≤2 色停止） | ✅ 实现 |
-| `writeMaskFilter` | 跳过（忽略） | ❌ 降级 |
-| `writeColorFilter` | 跳过（忽略） | ❌ 降级 |
-| `writePathEffect` | Dash 效果 | ✅ 实现 |
-| `writeImageFilter` | 跳过（忽略）— 遇到复杂 filter → 降级为位图 | ❌ 降级 |
-| `writeBlender` | 跳过（仅处理 kSrcOver 默认） | ❌ 降级 |
+| 函数 | 内容 | v3 状态 | 降级行为 |
+|------|------|---------|---------|
+| `writeShader` | 仅线性 `SkGradientShader`（≤2 色停止） | ✅ 实现 | — |
+| `writeMaskFilter` | 跳过（忽略） | ❌ 降级 | 画无滤镜版本（元素无阴影/模糊，视觉上可能变扁平） |
+| `writeColorFilter` | 跳过（忽略） | ❌ 降级 | 使用原始颜色（颜色可能不匹配，但不丢内容） |
+| `writePathEffect` | Dash 效果 | ✅ 实现 | — |
+| `writeImageFilter` | **光栅化为 bitmap → writeImage** | ⚠️ 降级 | 服务端使用 `SkSurface::MakeRasterN32Premul` 预渲染该绘制，结果通过图像通道下发（视觉效果正确，带宽增加） |
+| `writeBlender` | 跳过（使用 kSrcOver 默认） | ❌ 降级 | 混合模式可能不匹配，但不丢内容 |
 
 ##### B4. LayerRecorder + FrameAssembler 完整实现（2-3 人天）
+
+> **v4 补充 — 两阶段数据流**：`recordPictureLayer`（UpdateTiles 时捕获内容，不含变换）→ `recordLayerTransform`（DrawLayers 时捕获变换）→ `FrameAssembler::assembleFrame`（通过 `layer_id` 匹配内容与变换）。变换必须在 DrawLayers 时刻捕获，因为 CSS animation 可能在 UpdateTiles 和 DrawLayers 之间更新变换矩阵。
 
 ```cpp
 // layer_recorder.cpp — recordPictureLayer
@@ -733,9 +739,10 @@ void LayerRecorder::recordPictureLayer(
     snap.type = LayerSnapshot::Type::kPicture;
     snap.bounds = display_item_list->VisualRect();
     
-    // OOP 光栅化安全：DeepCopy PaintOpBuffer
-    // [CRITICAL]: 在 OOP 光栅化场景下，DisplayItemList 由 Viz 进程持有
-    // 必须通过 Lock + DeepCopy 复制 PaintOp 数据到本地
+    // OOP-R 兼容：PaintOpBuffer 在 Finalize 后不可变（const stream）
+    // 跨线程只读访问安全，直接拷贝 Data() 到本地 vector
+    // [U] display_item_list->paint_op_buffer() 需确认 M143 中是否为公共 API
+    //     若不可用，需通过 RasterSource::PlaybackToCanvas 间接获取
     auto* buffer = display_item_list->paint_op_buffer();
     if (buffer) {
         snap.paint_ops.assign(
@@ -775,6 +782,12 @@ void LayerRecorder::recordLayerTransform(
 **文件 1**：`cc/trees/layer_tree_host_impl.cc` — DrawLayers 钩子
 
 ```cpp
+// 在 DrawLayers() 末尾，添加 Garnet 钩子
+// GarnetInterceptor 生命周期（v4 补充）：
+//   - 创建：Renderer 主线程，Chromium 处理第一个导航请求时
+//   - 销毁：Renderer 进程终止时（Chromium 关闭时）
+//   - 线程安全：Compositor 线程只读访问，主线程写入配置
+//   - 实现模式：base::NoDestructor<GarnetInterceptor> 单例
 void LayerTreeHostImpl::DrawLayers(FrameData* frame) {
     // ... 现有 Chromium 逻辑 ...
     
@@ -882,10 +895,13 @@ cc/BUILD.gn                           # +1 行（依赖 garnet）
 [ ] 客户端解压 + CRC 校验通过
 [ ] CanvasKit 渲染结果对以下 5 个测试页面 SSIM > 0.95：
     1. 纯色页面 (solid red)
-    2. CSS 渐变 (linear-gradient)
+    2. CSS 渐变 (linear-gradient, ≤2 色停止)
     3. 纯文本页面 (Lorem ipsum)
     4. 单图像页面 (PNG 50KB)
     5. 混合页面 (文本 + 图像 + 色块)
+[ ] 范围外内容降级验证（非崩溃）：
+    6. WebP 图像页面 → 降级为占位矩形或跳过
+    7. <video> 页面 → VideoLayer 降级为占位矩形
 [ ] 端到端延迟 < 500ms (LAN)
 [ ] 1 小时连续运行零崩溃
 ```
@@ -947,7 +963,7 @@ cc/BUILD.gn                           # +1 行（依赖 garnet）
 ```
 Phase A 关键路径（不可并行）：
   A1(骨架) → A2(5个虚函数) → A3(序列化函数) → A6(FrameAssembler) → 集成调试
-  串行长度：15-22 人天
+  串行长度：10-16 人天
 
 Phase A 可并行：
   A4(SHA-256) ∥ A5(图像编码) ∥ A2/A3
@@ -955,7 +971,7 @@ Phase A 可并行：
 
 Phase B 关键路径：
   B1(onDraw* 补齐) → 集成调试
-  串行长度：10-15 人天
+  串行长度：6-12 人天
   B2(onDrawSlug 验证) ∥ B3(序列化补齐) ∥ B1
 ```
 
@@ -979,14 +995,22 @@ Phase B 关键路径：
 | 场景 | 内存项 | 估算 |
 |------|--------|------|
 | **空闲** | CommandBuffer 预分配 | 64 KB |
-| **简单页面**（10 张图片） | buffer + 10×sk_sp 引用 | ~2 MB |
-| **复杂页面**（50 张 4K 图片） | buffer + 50×sk_sp 引用（每张 33MB 内存持有） | **峰值 ~500 MB** |
-| **极限场景** | kMaxBytesPerFrame (64MB) + 100 张图片 sk_sp | ~700 MB |
+| **简单页面**（10 张图片） | buffer(64KB) + PaintOp拷贝(~2MB) + FrameBuffer(~3MB) + 10×sk_sp | ~7 MB |
+| **复杂页面**（50 张 4K 图片） | buffer(64MB 峰值) + PaintOp拷贝(64MB) + FrameBuffer(64MB) + 50×sk_sp（每张 33MB） | **峰值 ~550 MB** |
+| **极限场景** | kMaxBytesPerFrame(64MB) × 3（buffer + 拷贝 + FrameBuffer）+ 100 张 sk_sp | **~700 MB** |
+
+**补充说明**（v4 修正）：
+- `buffer_`：CommandBuffer 的命令流缓冲区（峰值 64MB）
+- PaintOp 拷贝：`paint_ops.assign()` 期间的内存（峰值 64MB，与 buffer_ 不同生命周期）
+- `FrameBuffer`：`AssembleFrame()` 组装期间的临时帧（峰值 64MB，头+命令流+CRC32）
+- 三项不会同时达到峰值（buffer_ 在 Finalize 后释放，PaintOp 拷贝在 assembleFrame 后释放）
 
 **缓解措施**：
 - `sk_sp<SkImage>` 仅持有引用（非拷贝），图像内存由 Chromium 资源管理
 - 帧间 `clear()` 释放 buffer + slots，释放图像引用
-- 极限场景 700MB 在 `kChromiumMaxMemoryBytes`（2GB）的 35% 以内，可接受
+- PaintOp 拷贝在 assembleFrame 后立即析构
+- FrameBuffer 由 Node.js gzip 压缩后立即释放
+- 极限场景 ~700MB 在 `kChromiumMaxMemoryBytes`（2GB）的 35% 以内，可接受
 
 ---
 
@@ -1027,7 +1051,7 @@ Phase B 关键路径：
 方案 1（推荐）：自编译 CanvasKit WASM
   从 Chromium 143 对应的 Skia 源码编译 CanvasKit
   优势：100% 二进制兼容，与 Chromium Skia 完全相同
-  劣势：需要 Skia 编译环境（Emscripten SDK + 首次编译 ~1h）
+  劣势：需要 Skia 编译环境（Emscripten SDK + 首次完整编译 ~2-4h）
 
 方案 2（次选）：使用匹配的 npm canvaskit-wasm 版本
   从 npmjs.com 选择与 Skia m143 最接近的 canvaskit-wasm 版本
