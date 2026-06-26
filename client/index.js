@@ -104,6 +104,9 @@ import {
     /** 图像 LRU 缓存 — hash-ref 模式下的图像复用 (§4.1.4) */
     let imageCache = null;        // ImageCache
 
+    /** 当前活跃字体 ID — FONT_DATA 设置，TEXT_BLOB 消费 */
+    let currentFontId = 0;       // 当前字体 ID（默认 0 = 回退字体）
+
     /** WebSocket 连接实例 (socket.io) */
     let socket = null;            // WebSocket (socket.io)
     /** 当前最新渲染帧 ID — 用于单调性检测和输入同步 */
@@ -116,6 +119,8 @@ import {
 
     /** 正在处理中的帧 ID — 最新帧策略的核心状态 */
     let pendingFrameId = null;   // 正在处理中的帧 ID（最新帧策略）
+    /** 待处理帧数据缓存 — 当 renderScheduled=true 时暂存最新帧数据 */
+    let pendingFrameData = null; // { commandStream, isKeyframe, dirtyRects } | null
     /** 是否已调度 requestAnimationFrame 回调 — 防止重复调度 */
     let renderScheduled = false; // 是否已调度渲染
 
@@ -414,10 +419,18 @@ import {
             // 情况 B: frame_id 跳跃超过阈值 (FRAME_ID_JUMP_THRESHOLD=1000)
             //   可能是大量帧丢失或服务端时钟异常。
             //   请求关键帧跳过中间丢失的增量帧。
-            if (header.frameId - currentFrameId > PROTOCOL.LIMITS.FRAME_ID_JUMP_THRESHOLD) {
+            // 使用无符号差值处理 uint32 回绕 (>>>0 确保无符号语义)
+            const frameIdDiff = header.frameId > currentFrameId
+                ? header.frameId - currentFrameId
+                : header.frameId < currentFrameId
+                    // 可能的 uint32 回绕: (max - current) + new + 1
+                    ? (0xFFFFFFFF - currentFrameId) + header.frameId + 1
+                    : 0;
+            if (frameIdDiff > PROTOCOL.LIMITS.FRAME_ID_JUMP_THRESHOLD) {
                 auditLog(LOG_LEVELS.WARN, 'frame_id_jump', {
                     from: currentFrameId,
                     to: header.frameId,
+                    diff: frameIdDiff,
                 });
                 socket.emit('request_keyframe');
             }
@@ -471,8 +484,15 @@ import {
             if (canvas.width !== newWidth || canvas.height !== newHeight) {
                 canvas.width = newWidth;
                 canvas.height = newHeight;
-                // CanvasKit surface 可能需要重建
-                // Phase 1: 尺寸不变时不重建
+                // 尺寸变更时重建 CanvasKit Surface 和 SkCanvas
+                if (surface) {
+                    surface.delete();
+                }
+                surface = canvasKit.MakeCanvasSurface(CONFIG.CANVAS_ID);
+                if (!surface) {
+                    throw new Error('Failed to recreate CanvasKit surface after resize');
+                }
+                skCanvas = surface.getCanvas();
             }
 
             // ── Step 8: 记录帧元数据 (用于输入坐标转换的 scroll 锚定 §7.3) ──
@@ -491,13 +511,16 @@ import {
             // (输入事件早已被服务端处理完毕)
             pruneFrameMetadata(header.timestampMs);
 
-            // ── Step 10: 设置 pending 帧 ID (最新帧策略) ──
+            // ── Step 10: 设置 pending 帧 ID + 缓存帧数据 (最新帧策略) ──
             pendingFrameId = header.frameId;
 
             // ── Step 11: 调度渲染 (如果尚未调度) ──
             if (!renderScheduled) {
                 renderScheduled = true;
                 await renderFrame(commandStream, header.isKeyframe, header.dirtyRects);
+            } else {
+                // 已有渲染进行中 — 缓存最新帧数据供 renderFrame 完成后消费
+                pendingFrameData = { commandStream, isKeyframe: header.isKeyframe, dirtyRects: header.dirtyRects };
             }
 
             auditLog(LOG_LEVELS.DEBUG, 'frame_received', {
@@ -587,6 +610,14 @@ import {
             auditLog(LOG_LEVELS.ERROR, 'render_error', { error: err.message });
         } finally {
             renderScheduled = false;
+            // 检查是否有待处理的更新帧数据（最新帧策略）
+            if (pendingFrameData) {
+                const pending = pendingFrameData;
+                pendingFrameData = null;
+                renderScheduled = true;  // 重新标记：即将渲染待处理帧
+                await renderFrame(pending.commandStream, pending.isKeyframe, pending.dirtyRects);
+                return;  // renderFrame 的 finally 会再次处理 pendingFrameData
+            }
             pendingFrameId = null;
         }
     }
@@ -752,12 +783,47 @@ import {
                 }
                 break;
 
+            case OP.DRAW_DRRECT:
+                // DRAW_DRRECT: outer rrect(49B) + inner rrect(49B) + paint(N)
+                // Phase 3+: 完整实现需 readRRect + readRRect + readPaint + drawDRRect
+                auditLog(LOG_LEVELS.ERROR, 'unimplemented_opcode', { opcode: 'DRAW_DRRECT', opcodeHex: '0x32' });
+                break;
+            case OP.DRAW_ARC:
+                // DRAW_ARC: oval(16B) + startAngle(4B) + sweepAngle(4B) + useCenter(1B) + paint(N)
+                // Phase 3+: 完整实现需 readRect + readPaint + drawArc
+                auditLog(LOG_LEVELS.ERROR, 'unimplemented_opcode', { opcode: 'DRAW_ARC', opcodeHex: '0x34' });
+                break;
+            case OP.DRAW_POINTS:
+                {
+                    const mode = payload.getUint8(0);
+                    const count = payload.getUint32(1, true);
+                    const pts = new Float32Array(count * 2);
+                    for (let i = 0; i < count; i++) {
+                        pts[i * 2]     = payload.getFloat32(5 + i * 8, true);
+                        pts[i * 2 + 1] = payload.getFloat32(9 + i * 8, true);
+                    }
+                    const paint = readPaint(payload, 5 + count * 8);
+                    skCanvas.drawPoints(mode, pts, paint);
+                    paint.delete();
+                }
+                break;
+            case OP.DRAW_REGION:
+                // DRAW_REGION: region(N) + paint(N) — Region 序列化格式复杂
+                // Phase 4+: 需 SkRegion 反序列化器
+                auditLog(LOG_LEVELS.ERROR, 'unimplemented_opcode', { opcode: 'DRAW_REGION', opcodeHex: '0x37' });
+                break;
+
             // ── 图像绘制 ──
             case OP.DRAW_IMAGE:
                 drawImageInline(payload, payLen);
                 break;
             case OP.DRAW_IMAGE_RECT:
                 drawImageRectInline(payload, payLen);
+                break;
+            case OP.DRAW_ATLAS:
+                // DRAW_ATLAS: count(4) + xforms[] + tex[] + colors[] + paint(N)
+                // Phase 4+: 复杂图集渲染，需反序列化 RSXform + 纹理坐标 + 颜色
+                auditLog(LOG_LEVELS.ERROR, 'unimplemented_opcode', { opcode: 'DRAW_ATLAS', opcodeHex: '0x43' });
                 break;
 
             // ── 文本绘制 ──
@@ -941,8 +1007,10 @@ import {
         }
 
         // 读取 tileMode 和 colorCount (在 header 末尾前)
-        const tileMode = payload.getUint8(offset + headerSize - 3);
-        const colorCount = payload.getUint8(offset + headerSize - 2);
+        // header 结构: [几何参数...] + tileMode(1B) + colorCount(1B) + _pad(2B)
+        // tileMode 在 headerSize-4, colorCount 在 headerSize-3 (与 validator 一致)
+        const tileMode = payload.getUint8(offset + headerSize - 4);
+        const colorCount = payload.getUint8(offset + headerSize - 3);
 
         // 读取颜色停止点
         const colors = [];
@@ -1143,8 +1211,8 @@ import {
             new Uint16Array(payload.buffer, payload.byteOffset + 12, glyphCount),
             // positions (x,y pairs)
             new Float32Array(payload.buffer, payload.byteOffset + 12 + glyphCount * 2, glyphCount * 2),
-            // default font
-            fontRegistry.getTypeface(0)
+            // 使用当前活跃字体（FONT_DATA 设置，回退为 fontId=0）
+            fontRegistry.getTypeface(currentFontId)
         );
 
         if (builder) {
@@ -1163,6 +1231,7 @@ import {
         );
 
         fontRegistry.registerFont(fontId, fontData);
+        currentFontId = fontId;  // 更新当前活跃字体 ID
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -1427,6 +1496,15 @@ import {
         for (const [id, meta] of frameMetadata) {
             if (meta.timestampMs < cutoff) {
                 frameMetadata.delete(id);
+            }
+        }
+        // 条目数硬上限: 防帧洪水撑爆 Map (与 server session.js 一致)
+        const maxEntries = PROTOCOL.LIMITS.FRAME_HISTORY_MAX_ENTRIES;
+        if (frameMetadata.size > maxEntries) {
+            const sorted = [...frameMetadata.entries()]
+                .sort((a, b) => a[1].timestampMs - b[1].timestampMs);
+            for (let i = 0; i < sorted.length - maxEntries; i++) {
+                frameMetadata.delete(sorted[i][0]);
             }
         }
     }

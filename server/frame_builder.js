@@ -153,7 +153,9 @@ function serializeFrameHeader(meta) {
 
     // Byte 6-13: timestamp_ms (int64 LE)
     // Node.js Buffer 支持 BigInt 写入，保证 64 位时间戳完整传递
-    buf.writeBigInt64LE(BigInt(meta.timestampMs), offset);
+    // 防御: BigInt() 对 NaN/Infinity/非整数抛出 TypeError
+    const ts = Number.isFinite(meta.timestampMs) ? BigInt(Math.trunc(meta.timestampMs)) : BigInt(Date.now());
+    buf.writeBigInt64LE(ts, offset);
     offset += 8;
 
     // Byte 14-17: scroll_x (int32 LE)

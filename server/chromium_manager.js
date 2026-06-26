@@ -159,10 +159,16 @@ class ChromiumInstance {
         ];
 
         // 安全审计: --no-sandbox 检查 (§10)
-        // 仅在环境变量显式设置时启用，生产部署必须移除该环境变量
+        // 双重确认: 仅在非生产环境且显式设置环境变量时启用
+        // 生产环境(NODE_ENV=production)下即使设置环境变量也不会禁用沙箱
         if (process.env.GARNET_UNSAFE_NO_SANDBOX === '1') {
-            args.push('--no-sandbox');
-            args.push('--disable-setuid-sandbox');
+            if (process.env.NODE_ENV === 'production') {
+                console.error('[chromium] CRITICAL: GARNET_UNSAFE_NO_SANDBOX ignored in production environment');
+            } else {
+                args.push('--no-sandbox');
+                args.push('--disable-setuid-sandbox');
+                console.warn('[chromium] WARNING: --no-sandbox enabled (GARNET_UNSAFE_NO_SANDBOX=1, non-production)');
+            }
         }
 
         args.push(...this._extraArgs);
@@ -194,6 +200,10 @@ class ChromiumInstance {
         // 启动超时处理 — 使用 Promise 包装 spawn 事件
         return new Promise((resolve, reject) => {
             const timeout = setTimeout(() => {
+                // 超时时强制终止子进程，防止僵尸进程累积
+                if (this._process && !this._process.killed) {
+                    this._process.kill('SIGKILL');
+                }
                 reject(new Error(`Chromium startup timeout (${CHROMIUM_STARTUP_TIMEOUT_MS}ms)`));
             }, CHROMIUM_STARTUP_TIMEOUT_MS);
 
@@ -296,6 +306,7 @@ class ChromiumInstance {
      */
     async restart() {
         await this.close();
+        this._closed = false;  // 重置关闭标志，允许 start() 重新启动
 
         // 指数退避: 1s → 2s → 4s → 8s → ... → 30s max
         const delay = Math.min(
@@ -335,15 +346,20 @@ class ChromiumInstance {
         // exitCode === null 表示进程仍在运行
         if (this._process.exitCode !== null) return false;
 
-        // 检查内存使用（仅 Linux/macOS）
-        // 注意: process.memoryUsage().rss 是 Node.js 进程的内存，不是 Chromium 的
-        // 实际的 Chromium 内存监控需要平台特定的 API（如 /proc/pid/status）
-        // 此处为占位实现，Phase 5+ 替换为实际实现
+        // 检查 Chromium 内存使用（Linux: /proc/pid/status 读取 VmRSS）
         try {
-            const memUsage = process.memoryUsage().rss;
-            // 预留: 若需检查 Chromium 内存，可通过 /proc/{pid}/status 读取 VmRSS
+            const statusFile = `/proc/${this._pid}/status`;
+            const statusContent = require('fs').readFileSync(statusFile, 'utf8');
+            const vmRssMatch = statusContent.match(/^VmRSS:\s+(\d+)\s+kB$/m);
+            if (vmRssMatch) {
+                const memBytes = parseInt(vmRssMatch[1], 10) * 1024;
+                if (memBytes > CHROMIUM_MAX_MEMORY_BYTES) {
+                    console.warn(`[chromium] Memory limit exceeded (pid=${this._pid}, ${(memBytes / 1024 / 1024).toFixed(0)}MB)`);
+                    return false;  // 超限 → 标记不健康，触发重启回收
+                }
+            }
         } catch (e) {
-            // 忽略监控失败 — 不影响健康判定
+            // /proc 不可用（非 Linux）或进程已退出 → 忽略内存检查
         }
 
         return true;

@@ -334,8 +334,10 @@ class CommandValidator {
                 }
                 // verbs: 1 byte each; points: 2×f32 each = 8 bytes
                 const minSize = 8 + verbCount + pointCount * 8;
-                if (minSize > payLen) {
-                    return this._subReject(`drawPath: sub-structure overflow (need ${minSize}, have ${payLen})`);
+                // 保守上界: 最坏情况每 verb 消耗 3 个 point (cubicTo)，防 verb 类型伪造越界读
+                const worstCaseSize = 8 + verbCount + verbCount * 3 * 8;
+                if (minSize > payLen || worstCaseSize > payLen) {
+                    return this._subReject(`drawPath: sub-structure overflow (need ≤${Math.max(minSize, worstCaseSize)}, have ${payLen})`);
                 }
                 break;
             }
@@ -344,6 +346,8 @@ class CommandValidator {
             // 威胁: count 炸弹 → 超大量点坐标
             case OP.DRAW_POINTS: {
                 if (payLen < 5) return this._subReject('drawPoints: payload too short');
+                const mode = payload.getUint8(0);             // mode 验证: 0=Points, 1=Lines, 2=Polygon
+                if (mode > 2) return this._subReject(`drawPoints: invalid mode ${mode}`);
                 const count = payload.getUint32(1, true);   // count 在 offset 1 (mode 占 1B)
                 if (count > this.LIMITS.MAX_PATH_VERBS) {
                     return this._subReject(`drawPoints: count ${count} > ${this.LIMITS.MAX_PATH_VERBS}`);
@@ -351,6 +355,12 @@ class CommandValidator {
                 const minSize = 5 + count * 8;              // mode(1) + count(4) + count×(2×f32)
                 if (minSize > payLen) {
                     return this._subReject(`drawPoints: sub-structure overflow (need ${minSize}, have ${payLen})`);
+                }
+                // 校验 Paint 中的 Shader 子结构 (Phase 2 深度校验)
+                const paintOff = 5 + count * 8;
+                if (payLen >= paintOff + 19) {
+                    const shaderResult = this._validatePaintShader(payload, paintOff, payLen);
+                    if (!shaderResult.valid) return shaderResult;
                 }
                 break;
             }
@@ -418,11 +428,22 @@ class CommandValidator {
                 if (payLen < 1) return this._subReject('drawImage: payload too short');
                 const flag = payload.getUint8(0);
                 if (flag === 0x01) {
-                    // hash-ref: 需要 flag(1B) + hash(32B) = 33B 最低
-                    if (payLen < 33) return this._subReject('drawImage: hash-ref too short');
+                    // hash-ref: 需要 flag(1B) + hash(32B) + x(4B) + y(4B) = 41B 最低
+                    if (payLen < 41) return this._subReject('drawImage: hash-ref too short');
                 } else if (flag === 0x00) {
-                    // inline: flag(1B) + slot_id(4B) 最低 = 5B
-                    if (payLen < 5) return this._subReject('drawImage: inline too short');
+                    // inline: flag(1B) + slot(4B) + dataSize(4B) + data[N] + x(4B) + y(4B)
+                    // 最低: 1+4+4+0+4+4 = 17B (dataSize=0)
+                    if (payLen < 17) return this._subReject('drawImage: inline too short');
+                    const dataSize = payload.getUint32(5, true);
+                    const minInline = 17 + dataSize;  // 确保坐标 x/y 在 payload 内
+                    if (opcode === OP.DRAW_IMAGE_RECT) {
+                        // 额外 32B: src(16B) + dst(16B)
+                        if (minInline + 32 > payLen) return this._subReject(
+                            `drawImageRect: inline overflow (need ${minInline + 32}, have ${payLen})`);
+                    } else {
+                        if (minInline > payLen) return this._subReject(
+                            `drawImage: inline overflow (need ${minInline}, have ${payLen})`);
+                    }
                 } else {
                     // 未知的 flag 值 — 可能为未来扩展或攻击
                     return this._subReject(`drawImage: unknown image flag ${flag}`);
@@ -452,18 +473,16 @@ class CommandValidator {
             case OP.DRAW_RRECT:
             case OP.DRAW_OVAL:
             case OP.DRAW_ARC:
-            case OP.DRAW_PATH:
             case OP.DRAW_PAINT:
             case OP.DRAW_SHADOW: {
                 // Paint 在 payload 中的偏移因命令而异:
                 //   DRAW_RECT:  rect(16B) + paint → paint@16
                 //   DRAW_RRECT: rrect(12×f32 + 1B type = 49B) + paint → paint@49
                 //   DRAW_OVAL:  rect(16B) + paint → paint@16
-                //   DRAW_ARC:   rect(16B) + startAngle(4B) + sweepAngle(4B) = 24B? 实际需确认
-                //   DRAW_PATH:  path(变长) — 偏移不固定，跳过 Shader 校验
+                //   DRAW_ARC:   rect(16B) + startAngle(4B) + sweepAngle(4B) + useCenter(1B) = 25B
                 //   DRAW_PAINT: paint@0 (整个 payload 就是 Paint)
                 //   DRAW_SHADOW: paint@0 (整个 payload 就是 Paint)
-                //   DRAW_PAINT 和 DRAW_SHADOW 无几何体，仅 Paint 数据
+                // DRAW_POINTS 的 Shader 校验已内联至其 case 块；DRAW_PATH 因变长结构跳过 Shader 校验
 
                 let paintOffset = -1;  // -1 表示不校验 (如变长路径)
                 if (opcode === OP.DRAW_PAINT || opcode === OP.DRAW_SHADOW) {
@@ -473,10 +492,8 @@ class CommandValidator {
                 } else if (opcode === OP.DRAW_RRECT) {
                     paintOffset = 49;       // 12×f32 + 1B type = 49B (含 1B 类型标记)
                 } else if (opcode === OP.DRAW_ARC) {
-                    paintOffset = 20;       // rect(16B) + startAngle(4B) = 20B (sweepAngle 在 Paint 后)
+                    paintOffset = 25;       // rect(16B) + startAngle(4B) + sweepAngle(4B) + useCenter(1B) = 25B
                 }
-                // DRAW_PATH: paint 在 path verbs 末尾，偏移不固定，跳过 Shader 校验
-                // (path 子结构已在 drawPath case 中校验)
                 if (paintOffset >= 0 && payLen >= paintOffset + 19) {
                     // 需要至少 19 字节 — Paint 固定头 (18B) + has_shader (1B)
                     const shaderResult = this._validatePaintShader(

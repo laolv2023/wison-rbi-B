@@ -168,6 +168,9 @@ class InputProxy {
         // 快速退出: 会话已关闭则不处理任何输入
         if (this._session.closed) return;
 
+        // 防御: 拒绝非对象或空事件
+        if (!event || typeof event !== 'object') return;
+
         const { type, frameId } = event;
 
         switch (type) {
@@ -248,8 +251,11 @@ class InputProxy {
 
         return {
             // 核心转换公式: canvas物理像素 / dpr + scroll偏移 = 页面CSS坐标
-            pageX: meta.scrollX + canvasX / Math.max(this._dpr, 1),
-            pageY: meta.scrollY + canvasY / Math.max(this._dpr, 1),
+            // 边界钳制: 限制在合理视口范围 ±100px 内，防止异常坐标注入
+            pageX: Math.max(-100, Math.min(meta.viewportW + 100,
+                meta.scrollX + canvasX / Math.max(this._dpr, 1))),
+            pageY: Math.max(-100, Math.min(meta.viewportH + 100,
+                meta.scrollY + canvasY / Math.max(this._dpr, 1))),
             valid: true,
         };
     }

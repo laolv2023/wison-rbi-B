@@ -56,6 +56,11 @@
 #include <string>
 #include <vector>
 
+// sk_sp<T> 智能指针 — Skia 线程安全引用计数 (§4.1.4 并发模型)
+// 在 Chromium 源码树中编译路径: third_party/skia/include/core/SkRefCnt.h
+// 对于独立编译 (如 Node.js native addon): 需确保 Skia include path 已配置
+#include "include/core/SkRefCnt.h"
+
 // 前向声明 Skia 类型（不引入完整 Skia 头以减少编译依赖）
 class SkImage;
 class SkPaint;
@@ -96,7 +101,7 @@ namespace garnet {
 //           data 仅在 Worker 线程写入，之后内存屏障保证可见性。
 struct ImageSlot {
     uint32_t id;              ///< 槽位 ID（在命令流中通过 writeU32 引用）
-    const SkImage* image;     ///< sk_sp 持有引用（非拥有），线程安全引用计数
+    sk_sp<const SkImage> image; ///< sk_sp 持有引用，线程安全引用计数 (Skia 保证)
     bool encoded;             ///< 是否已编码标志（防止 Worker 线程重复编码）
     std::vector<uint8_t> data; ///< 编码后的图像数据（PNG/JPEG/WebP 原始字节）
 

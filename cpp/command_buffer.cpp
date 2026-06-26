@@ -149,8 +149,8 @@ void CommandBuffer::growBuffer(size_t min_capacity) {
     if (new_cap > kMaxBytesPerFrame) {
         new_cap = kMaxBytesPerFrame;
     }
-    // 二次检查: 当前已用 + 新增需求是否超出硬上限
-    if (buffer_.size() + (min_capacity - buffer_.size()) > kMaxBytesPerFrame) {
+    // 二次检查: min_capacity 本身是否超出硬上限
+    if (min_capacity > kMaxBytesPerFrame) {
         throw std::length_error("CommandBuffer: frame exceeds MAX_BYTES_PER_FRAME");
     }
     buffer_.reserve(new_cap);
@@ -535,15 +535,16 @@ void CommandBuffer::writeM44(const SkM44&) {
 /// @brief 预留图像槽位（Compositor 线程，O(1)）。
 ///
 /// 仅分配槽位 ID 并捕获 sk_sp 引用，不调用 encodeToData()。
+/// sk_sp 构造时递增引用计数，确保 Worker 线程访问时图像仍存活。
 /// 槽位 ID 从 0 开始，每次调用递增 (image_slots_.size())。
 ///
-/// @param image Skia 图像指针（sk_sp 引用计数 +1）
+/// @param image Skia 图像指针（调用方持有 sk_sp，此处再增加一个引用）
 /// @returns 槽位 ID（在命令流中通过 writeU32 写入）
 uint32_t CommandBuffer::reserveImageSlot(const SkImage* image) {
     uint32_t slot_id = static_cast<uint32_t>(image_slots_.size());
     ImageSlot slot;
     slot.id = slot_id;
-    slot.image = image;    // sk_sp 引用计数 +1 (线程安全)
+    slot.image = sk_sp<const SkImage>(image);  // 构造 sk_sp，递增引用计数（线程安全）
     slot.encoded = false;  // 标记为"待编码"
     image_slots_.push_back(slot);
     return slot_id;
@@ -647,8 +648,14 @@ bool CommandBuffer::hasImageHash(const ImageHash& hash) const {
 ///
 /// 仅在 hash-ref 模式 + 首次遇到图像时调用。
 /// 注意: 不检查重复（调用者应先用 hasImageHash 检查）。
+/// 容量控制: 超出 kMaxSentHashes 时移除最旧的一半条目（FIFO 淘汰）。
 void CommandBuffer::markImageHashSent(const ImageHash& hash) {
     sent_hashes_.push_back(hash);
+    if (sent_hashes_.size() > kMaxSentHashes) {
+        // FIFO 淘汰: 移除前半部分最旧的条目
+        size_t keep = kMaxSentHashes / 2;
+        sent_hashes_.erase(sent_hashes_.begin(), sent_hashes_.begin() + (sent_hashes_.size() - keep));
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════

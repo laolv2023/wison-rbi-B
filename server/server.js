@@ -70,6 +70,7 @@ const {
     checkAlerts,
 } = require('./metrics');
 const {
+    MAX_BYTES_PER_FRAME,
     WS_HIGH_WATER_MARK,
     PROTOCOL_VERSION,
     TLS_DEFAULT_CERT_PATH,
@@ -108,6 +109,10 @@ class WisonRBIServer {
         const tlsCa   = options.tlsCa   || TLS_DEFAULT_CA_PATH;
         // TLS 启用条件: 同时提供 cert 和 key
         this._tlsEnabled = !!(tlsCert && tlsKey);
+        // 安全警告: 若 WISON_TLS_ENABLED 显式设置但实际未启用 TLS
+        if (process.env.WISON_TLS_ENABLED === '1' && !this._tlsEnabled) {
+            console.error('[server] WARNING: WISON_TLS_ENABLED=1 but TLS disabled (cert/key missing or empty)');
+        }
 
         let server;
         if (this._tlsEnabled) {
@@ -120,9 +125,14 @@ class WisonRBIServer {
             };
             // mTLS: 若提供 CA 证书，启用双向认证
             if (tlsCa) {
-                tlsOptions.ca = fs.readFileSync(tlsCa);
-                tlsOptions.requestCert = true;
-                tlsOptions.rejectUnauthorized = true;  // 拒绝未提供有效证书的客户端
+                try {
+                    tlsOptions.ca = fs.readFileSync(tlsCa);
+                    tlsOptions.requestCert = true;
+                    tlsOptions.rejectUnauthorized = true;  // 拒绝未提供有效证书的客户端
+                } catch (caErr) {
+                    console.error(`[server] WARNING: CA cert not found at ${tlsCa}, mTLS disabled:`, caErr.message);
+                    // mTLS 失败不影响 TLS 1.3 正常工作
+                }
             }
             server = https.createServer(tlsOptions, (req, res) => {
                 this._handleHttpRequest(req, res);
@@ -141,7 +151,7 @@ class WisonRBIServer {
         // WebSocket 协议层限制，防止超大消息耗尽内存
         this._wsServer = new WsServer({
             server: this._httpServer,          // 复用 HTTP server
-            maxPayload: 64 * 1024 * 1024,      // 64MB (与 MAX_BYTES_PER_FRAME 一致)
+            maxPayload: MAX_BYTES_PER_FRAME,      // 64MB (与 MAX_BYTES_PER_FRAME 一致)
         });
 
         // ── 会话管理 ──
@@ -357,6 +367,13 @@ class WisonRBIServer {
         ws.on('error', (err) => {
             console.error(`[server] WebSocket error for ${sessionId}:`, err.message);
             metrics.counter(WS_ERRORS);
+            // 错误时关闭会话释放资源，防止僵尸会话累积
+            session.close();
+            this._sessions.delete(sessionId);
+            metrics.decGauge(SESSIONS_ACTIVE);
+            this._chromiumPool.release(sessionId).catch(releaseErr => {
+                console.error(`[server] Error releasing chromium on ws error:`, releaseErr.message);
+            });
         });
 
         // ── 背压监控 (§4 / §8) ──
@@ -471,7 +488,12 @@ class WisonRBIServer {
      * @param {object} msg - 客户端消息（可能包含 url 或 data 字段）
      */
     async _handleReady(session, inputProxy, msg) {
-        const url = msg.url || msg.data || 'about:blank';
+        let url = msg.url || msg.data || 'about:blank';
+        // URL 协议白名单: 仅允许 http/https，拒绝 file/javascript/data 等非 Web 协议
+        if (!/^https?:\/\//i.test(url) && url !== 'about:blank') {
+            console.warn(`[server] Rejected non-web URL: ${url}`);
+            url = 'about:blank';
+        }
         console.log(`[server] Session ${session.sessionId} navigating to: ${url}`);
 
         try {
@@ -550,8 +572,9 @@ class WisonRBIServer {
 
         } catch (err) {
             console.error(`[server] Failed to send frame ${frameMeta.frameId}:`, err.message);
+            metrics.counter(FRAMES_DROPPED);
             // 帧组装失败 — 不发送，客户端将看到上一帧的画面
-            // 常见失败原因: 压缩炸弹检测、帧大小超限
+            // 常见失败原因: 压缩炸弹检测、帧大小超限、WebSocket 断开
         }
     }
 

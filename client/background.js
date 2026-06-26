@@ -59,7 +59,10 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
     // 仅在 URL 变化且不是扩展页面时触发
     if (!changeInfo.url) return;
     if (changeInfo.url.startsWith('chrome-extension://')) return;
-    if (changeInfo.url.includes('wison-rbi-bypass')) return;
+    // 防止重定向循环: 检查是否已经是扩展隔离页面
+    if (changeInfo.url.startsWith(EXTENSION_PAGE)) return;
+    // 跳过受保护的内部页面
+    if (/^(chrome|about|edge|chrome-extension|devtools|javascript):\/\//.test(changeInfo.url)) return;
 
     // 构建重定向 URL —— 目标页面为扩展内置的 index.html
     // 原始 URL 作为查询参数传递，由 index.js 解析后在隔离环境中加载

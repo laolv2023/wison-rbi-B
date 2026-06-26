@@ -216,6 +216,8 @@ const PROTOCOL = Object.freeze({
         MAX_FONT_INLINE_BYTES:    5 * 1024 * 1024,
         /** 帧元数据最大保留时间 (3s)。超时的帧元数据在 pruneFrameMetadata 中清理。 */
         FRAME_HISTORY_MAX_AGE_MS: 3000,
+        /** 帧元数据 Map 最大条目数硬上限 (v1.6 P0 S1)。防止帧洪水导致客户端内存膨胀。 */
+        FRAME_HISTORY_MAX_ENTRIES: 1000,
         /** 连续拒绝帧数阈值。达到后客户端发送 request_keyframe 请求全量刷新。 */
         CONSECUTIVE_REJECT_THRESHOLD: 3,
         /** frame_id 跳变阈值。检测服务端重启 (frame_id 归零) 或异常帧丢弃。 */

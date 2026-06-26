@@ -159,6 +159,13 @@ constexpr uint32_t kMaxAtlasCount = 100000;
 /// 命中时仅需 32B 哈希引用而非完整图像数据。
 constexpr size_t kImageCacheBytes = 64 * 1024 * 1024;  // 64 MB
 
+/// @brief 服务端已发送图像哈希集合最大容量: 100,000。
+///
+/// 安全理由: sent_hashes_ 跨帧保留用于 hash-ref 去重，无上限可导致
+/// 长期运行后内存无限增长。100,000 条 SHA-256 哈希 ≈ 3.2MB 内存，
+/// 超出时移除最旧的一半条目（FIFO 淘汰策略）。
+constexpr size_t kMaxSentHashes = 100000;
+
 /// @brief 客户端字体 LRU 缓存大小: 64 MB。
 ///
 /// 安全理由: 限制 @font-face 内联字体的缓存内存占用。
@@ -176,13 +183,14 @@ constexpr size_t kMaxFontInlineBytes = 5 * 1024 * 1024;  // 5 MB
 // 帧历史/会话上限 — §7 帧元数据与输入同步
 // ═══════════════════════════════════════════════════════════════
 
-/// @brief 帧历史最大保留时间: 1000 ms。
+/// @brief 帧历史最大保留时间: 3000 ms。
 ///
 /// 安全理由: 防止帧历史无限增长耗尽内存。
-/// 1000ms 覆盖合理输入延迟（网络 RTT ~200ms + 帧生成 ~2ms + 余量）。
+/// 3000ms 覆盖跨洲网络延迟（RTT 300-500ms）+ 帧生成 + jitter buffer 余量。
+/// 与 server/config.js 和 client/protocol.js 保持一致。
 ///
 /// 关联: §7.2 时序图，§7.5 降级策略。
-constexpr int64_t kFrameHistoryMaxAgeMs = 1000;
+constexpr int64_t kFrameHistoryMaxAgeMs = 3000;
 
 /// @brief 帧历史最大条目数（硬上限）: 1000。
 ///

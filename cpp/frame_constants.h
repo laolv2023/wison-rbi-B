@@ -204,6 +204,9 @@ enum class Opcode : uint8_t {
 ///
 /// @param op 待校验的 opcode 值
 /// @returns true 若 op 在 0x01-0x7F 范围
+/// @note C++ 层使用范围校验（0x01-0x7F），客户端使用精确 Opcode 枚举白名单。
+///       客户端校验更严格，是纵深防御的最后一道防线。服务端的范围校验提供
+///       基本过滤，具体命令合法性由客户端最终裁决。
 inline bool IsValidOpcode(uint8_t op) {
     return op >= 0x01 && op <= 0x7F;
 }
