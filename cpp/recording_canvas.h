@@ -46,6 +46,8 @@
 
 #include "command_buffer.h"
 
+#include <stdexcept>
+
 // Skia 实际头文件路径 (Chromium 源码树):
 #include "include/core/SkCanvas.h"
 #include "include/core/SkBitmap.h"
@@ -120,16 +122,16 @@ public:
     // ═══════════════════════════════════════════════════════════
 
     /// @brief 保存当前画布状态（矩阵 + 裁剪），opcode 0x01。
-    void save();
+    int save() override;
 
     /// @brief 恢复最近保存的画布状态，opcode 0x02。
-    void restore();
+    void restore() override;
 
     /// @brief 保存图层（可选 bounds + paint），opcode 0x03。
     ///
     /// @param bounds 图层边界（可为 nullptr）
     /// @param paint  图层 Paint（可为 nullptr）
-    void saveLayer(const SkRect* bounds, const SkPaint* paint);
+    int saveLayer(const SkRect* bounds, const SkPaint* paint) override;
 
     // ═══════════════════════════════════════════════════════════
     // 变换 — Opcode 0x10-0x1F (§4.1.2 变换捕获)
@@ -140,21 +142,21 @@ public:
 
     /// @brief 连接 3×3 变换矩阵，opcode 0x10。
     /// @param matrix SkMatrix (9 × f32 = 36 bytes)
-    void concat(const SkMatrix& matrix);
+    void concat(const SkMatrix& matrix) override;
 
     /// @brief 平移，opcode 0x11。
     /// @param dx X 方向位移 (SkScalar = float)
     /// @param dy Y 方向位移
-    void translate(SkScalar dx, SkScalar dy);
+    void translate(SkScalar dx, SkScalar dy) override;
 
     /// @brief 缩放，opcode 0x12。
     /// @param sx X 方向缩放因子
     /// @param sy Y 方向缩放因子
-    void scale(SkScalar sx, SkScalar sy);
+    void scale(SkScalar sx, SkScalar sy) override;
 
     /// @brief 旋转，opcode 0x13。
     /// @param radians 旋转弧度（逆时针为正）
-    void rotate(SkScalar radians);
+    void rotate(SkScalar radians) override;
 
     /// @brief 连接 4×4 变换矩阵，opcode 0x14 (v1.6 新增)。
     ///
@@ -162,7 +164,7 @@ public:
     /// 替代 Phase 1/2 的 3×3 矩阵，支持 CSS transform: matrix3d。
     ///
     /// @param matrix SkM44 4×4 矩阵
-    void concat44(const SkM44& matrix);
+    void concat44(const SkM44& matrix) override;
 
     // ═══════════════════════════════════════════════════════════
     // 裁剪 — Opcode 0x20-0x2F
@@ -172,13 +174,13 @@ public:
     /// @param rect 裁剪矩形
     /// @param op   裁剪操作（intersect/difference）
     /// @param doAA 是否抗锯齿
-    void clipRect(const SkRect& rect, SkClipOp op, bool doAA);
+    void clipRect(const SkRect& rect, SkClipOp op, bool doAA) override;
 
     /// @brief 圆角矩形裁剪，opcode 0x21。
-    void clipRRect(const SkRRect& rrect, SkClipOp op, bool doAA);
+    void clipRRect(const SkRRect& rrect, SkClipOp op, bool doAA) override;
 
     /// @brief 路径裁剪，opcode 0x22。
-    void clipPath(const SkPath& path, SkClipOp op, bool doAA);
+    void clipPath(const SkPath& path, SkClipOp op, bool doAA) override;
 
     // ═══════════════════════════════════════════════════════════
     // 形状绘制 — Opcode 0x30-0x3F (§4.1.2 onDraw* 拦截)
@@ -186,15 +188,15 @@ public:
     // 每个方法序列化: opcode + 形状参数 + SkPaint。
     // @{
 
-    void drawRect(const SkRect& rect, const SkPaint& paint);
-    void drawRRect(const SkRRect& rrect, const SkPaint& paint);
+    void drawRect(const SkRect& rect, const SkPaint& paint) override;
+    void drawRRect(const SkRRect& rrect, const SkPaint& paint) override;
     void drawDRRect(const SkRRect& outer, const SkRRect& inner,
                     const SkPaint& paint);
-    void drawOval(const SkRect& oval, const SkPaint& paint);
+    void drawOval(const SkRect& oval, const SkPaint& paint) override;
     void drawArc(const SkRect& oval, SkScalar startAngle,
                  SkScalar sweepAngle, bool useCenter,
                  const SkPaint& paint);
-    void drawPath(const SkPath& path, const SkPaint& paint);
+    void drawPath(const SkPath& path, const SkPaint& paint) override;
     void drawPoints(SkCanvas::PointMode mode, size_t count,
                     const SkPoint pts[], const SkPaint& paint);
     /// @}
@@ -284,13 +286,13 @@ public:
     // @{
 
     /// @brief 用 Paint 填充整个画布，opcode 0x60。
-    void drawPaint(const SkPaint& paint);
+    void drawPaint(const SkPaint& paint) override;
 
     /// @brief 用纯色填充整个画布，opcode 0x61。
-    void drawColor(SkColor4f color, SkBlendMode mode = SkBlendMode::kSrcOver);
+    void drawColor(SkColor4f color, SkBlendMode mode = SkBlendMode::kSrcOver) override;
 
     /// @brief 绘制阴影，opcode 0x62。
-    void drawShadow(const SkPath& path, const SkDrawShadowRec& rec);
+    void drawShadow(const SkPath& path, const SkDrawShadowRec& rec) override;
 
     /// @brief 绘制顶点对象，opcode 0x63。
     ///
@@ -302,10 +304,10 @@ public:
     ///
     /// @warning SkDrawable 不可序列化 — 此调用降级为 kNoop (opcode 0x7F)。
     ///          客户端将跳过此命令，不会在 Canvas 上执行任何绘制。
-    void drawDrawable(SkDrawable* drawable, const SkMatrix* matrix = nullptr);
+    void drawDrawable(SkDrawable* drawable, const SkMatrix* matrix = nullptr) override;
 
     /// @brief 绘制注解，opcode 0x65。
-    void drawAnnotation(const SkRect& rect, const char key[], SkData* value);
+    void drawAnnotation(const SkRect& rect, const char key[], SkData* value) override;
     /// @}
 
     // ═══════════════════════════════════════════════════════════
@@ -383,11 +385,29 @@ private:
     RecordingCanvas(int width, int height, ImageMode image_mode,
                     const SkBitmap& device);
 
+    // v4: Exception-safe command wrapper (§4.1.2)
+    template<typename F>
+    void safeCommand(garnet::Opcode opcode, F&& writeFunc) {
+        if (!recording_ || finalized_) return;
+        buffer_.beginCommand(opcode);
+        try {
+            writeFunc();
+            buffer_.endCommand();
+        } catch (...) {
+            // On exception during write, reset command state
+            // TODO: CommandBuffer should expose abortCommand() for proper cleanup
+            // Currently endCommand() handles in_command_ reset
+            buffer_.endCommand();
+            throw;
+        }
+    }
+
     CommandBuffer buffer_;     ///< 序列化命令缓冲区（录制目标）
     int width_;                ///< 物理画布宽度
     int height_;               ///< 物理画布高度
     ImageMode image_mode_;     ///< 图像传输模式
     bool recording_;           ///< 录制状态标志
+    bool finalized_ = false;   ///< 最终化状态标志（防止 use-after-finalize）
     SkBitmap minimal_device_;  ///< 1×1 最小 device，仅用于满足 SkCanvas 构造
 
     /// @brief Save/Restore 深度跟踪。
