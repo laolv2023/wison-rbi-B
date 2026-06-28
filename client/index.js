@@ -402,13 +402,24 @@ import {
             }
 
             // ── Step 5: frame_id 单调性检查 (§7.4) ──
-            // 情况 A: frame_id 倒退 → 服务端可能重启了 (frame_id 归零)。
+            // 使用无符号差值处理 uint32 回绕 (>>>0 确保无符号语义)
+            // uint32 回绕: (max - current) + new + 1
+            // 服务端重启: frame_id 归零，diff 通常很大
+            const frameIdDiff = header.frameId > currentFrameId
+                ? header.frameId - currentFrameId
+                : header.frameId < currentFrameId
+                    ? (0xFFFFFFFF - currentFrameId) + header.frameId + 1
+                    : 0;
+
+            // 情况 A: frame_id 倒退且 diff 超过阈值 → 服务端可能重启了 (frame_id 归零)。
             //   清空所有客户端缓存状态 (帧元数据、图像、字体)，
             //   请求关键帧以重建完整状态。
-            if (header.frameId < currentFrameId) {
+            //   注意: 正常 uint32 回绕 (diff=1) 不触发清空。
+            if (header.frameId < currentFrameId && frameIdDiff > PROTOCOL.LIMITS.FRAME_ID_JUMP_THRESHOLD) {
                 auditLog(LOG_LEVELS.WARN, 'frame_id_reset_detected', {
                     previous: currentFrameId,
                     received: header.frameId,
+                    diff: frameIdDiff,
                 });
                 frameMetadata.clear();
                 imageCache.clear();
@@ -419,13 +430,6 @@ import {
             // 情况 B: frame_id 跳跃超过阈值 (FRAME_ID_JUMP_THRESHOLD=1000)
             //   可能是大量帧丢失或服务端时钟异常。
             //   请求关键帧跳过中间丢失的增量帧。
-            // 使用无符号差值处理 uint32 回绕 (>>>0 确保无符号语义)
-            const frameIdDiff = header.frameId > currentFrameId
-                ? header.frameId - currentFrameId
-                : header.frameId < currentFrameId
-                    // 可能的 uint32 回绕: (max - current) + new + 1
-                    ? (0xFFFFFFFF - currentFrameId) + header.frameId + 1
-                    : 0;
             if (frameIdDiff > PROTOCOL.LIMITS.FRAME_ID_JUMP_THRESHOLD) {
                 auditLog(LOG_LEVELS.WARN, 'frame_id_jump', {
                     from: currentFrameId,
@@ -643,6 +647,14 @@ import {
                            (view.getUint8(offset + 2) << 8) |
                            (view.getUint8(offset + 3) << 16));
 
+            // 边界检查: payload 不得超出 commandStream
+            if (offset + PROTOCOL.COMMAND_HEADER_SIZE + payLen > commandStream.byteLength) {
+                auditLog(LOG_LEVELS.ERROR, 'replayCommands_payload_exceeds_stream', {
+                    offset, payLen, streamLen: commandStream.byteLength
+                });
+                break;
+            }
+
             const payload = new DataView(
                 commandStream,
                 offset + PROTOCOL.COMMAND_HEADER_SIZE,
@@ -684,9 +696,36 @@ import {
                 break;
             case OP.SAVE_LAYER:
                 {
-                    const paint = readPaint(payload, 0);
-                    skCanvas.saveLayer(paint);
-                    paint.delete();
+                    // Protocol: bounds_presence(1B) + [bounds(16B)] + paint_presence(1B) + [paint(N)]
+                    let off = 0;
+                    const hasBounds = payload.getUint8(off); off += 1;
+                    let bounds = null;
+                    if (hasBounds) {
+                        bounds = [
+                            payload.getFloat32(off, true),      // left
+                            payload.getFloat32(off + 4, true),  // top
+                            payload.getFloat32(off + 8, true),  // right
+                            payload.getFloat32(off + 12, true)  // bottom
+                        ];
+                        off += 16;
+                    }
+                    const hasPaint = payload.getUint8(off); off += 1;
+                    let paint = null;
+                    if (hasPaint) {
+                        paint = readPaint(payload, off);
+                    }
+                    if (paint) {
+                        if (bounds) {
+                            const r = new CanvasKit.LTRBRect(bounds[0], bounds[1], bounds[2], bounds[3]);
+                            skCanvas.saveLayer(paint, r);
+                            r.delete();
+                        } else {
+                            skCanvas.saveLayer(paint);
+                        }
+                        paint.delete();
+                    } else {
+                        skCanvas.saveLayer(null, bounds ? new CanvasKit.LTRBRect(bounds[0], bounds[1], bounds[2], bounds[3]) : null);
+                    }
                 }
                 break;
 
@@ -736,6 +775,10 @@ import {
                 break;
             case OP.CLIP_PATH:
                 {
+                    if (payLen < 2) {
+                        auditLog(LOG_LEVELS.WARN, 'clipPath_payload_too_short', { payLen });
+                        break;
+                    }
                     const path = readPath(payload, 0);
                     const op = payload.getUint8(payLen - 2);
                     const doAA = payload.getUint8(payLen - 1);
@@ -749,24 +792,30 @@ import {
                 {
                     const rect = readRect(payload, 0);
                     const paint = readPaint(payload, 16);
-                    skCanvas.drawRect(rect, paint);
-                    paint.delete();
+                    if (paint) {
+                        skCanvas.drawRect(rect, paint);
+                        paint.delete();
+                    }
                 }
                 break;
             case OP.DRAW_RRECT:
                 {
                     const rrect = readRRect(payload, 0);
                     const paint = readPaint(payload, 49);
-                    skCanvas.drawRRect(rrect, paint);
-                    paint.delete();
+                    if (paint) {
+                        skCanvas.drawRRect(rrect, paint);
+                        paint.delete();
+                    }
                 }
                 break;
             case OP.DRAW_OVAL:
                 {
                     const rect = readRect(payload, 0);
                     const paint = readPaint(payload, 16);
-                    skCanvas.drawOval(rect, paint);
-                    paint.delete();
+                    if (paint) {
+                        skCanvas.drawOval(rect, paint);
+                        paint.delete();
+                    }
                 }
                 break;
             case OP.DRAW_PATH:
@@ -774,12 +823,21 @@ import {
                     const verbCount = payload.getUint32(0, true);
                     const pointCount = payload.getUint32(4, true);
                     const path = readPath(payload, 0);
-                    // Paint 位于 path 动词 + 点数据之后
-                    const paintOffset = 8 + verbCount + pointCount * 8;
+                    // 计算 conicCount: 需要遍历 verbs 统计 kConic(3) 的数量
+                    let conicCount = 0;
+                    if (verbCount > 0 && offset + 8 + verbCount <= payload.byteLength) {
+                        for (let i = 0; i < verbCount; i++) {
+                            if (payload.getUint8(8 + i) === 3) conicCount++;
+                        }
+                    }
+                    // Paint 位于 path 数据之后: verbs + points + conicWeights
+                    const paintOffset = 8 + verbCount + pointCount * 8 + conicCount * 4;
                     const paint = readPaint(payload, paintOffset);
-                    skCanvas.drawPath(path, paint);
+                    if (paint) {
+                        skCanvas.drawPath(path, paint);
+                        paint.delete();
+                    }
                     path.delete();
-                    paint.delete();
                 }
                 break;
 
@@ -803,8 +861,10 @@ import {
                         pts[i * 2 + 1] = payload.getFloat32(9 + i * 8, true);
                     }
                     const paint = readPaint(payload, 5 + count * 8);
-                    skCanvas.drawPoints(mode, pts, paint);
-                    paint.delete();
+                    if (paint) {
+                        skCanvas.drawPoints(mode, pts, paint);
+                        paint.delete();
+                    }
                 }
                 break;
             case OP.DRAW_REGION:
@@ -830,13 +890,18 @@ import {
             case OP.DRAW_TEXT_BLOB:
                 drawTextBlob(payload, payLen);
                 break;
+            case OP.DRAW_GLYPH_RUN_LIST:
+                drawGlyphRunList(payload, payLen);
+                break;
 
             // ── 其他绘制 ──
             case OP.DRAW_PAINT:
                 {
                     const paint = readPaint(payload, 0);
-                    skCanvas.drawPaint(paint);
-                    paint.delete();
+                    if (paint) {
+                        skCanvas.drawPaint(paint);
+                        paint.delete();
+                    }
                 }
                 break;
             case OP.DRAW_COLOR:
@@ -855,7 +920,82 @@ import {
                 handleFontData(payload, payLen);
                 break;
             case OP.IMAGE_DATA:
-                // 图像内联引用 — 在 drawImage 中处理
+                // 图像内联数据: slot_id(4B) + data_size(4B) + data(N) + [hash(32B) if secure]
+                {
+                    if (payLen < 8) {
+                        auditLog(LOG_LEVELS.WARN, 'image_data_too_short', { payLen });
+                        break;
+                    }
+                    const imgSlotId = payload.getUint32(0, true);
+                    const imgDataSize = payload.getUint32(4, true);
+                    if (8 + imgDataSize > payLen) {
+                        auditLog(LOG_LEVELS.WARN, 'image_data_exceeds_payload', { imgDataSize, payLen });
+                        break;
+                    }
+                    // 安全: 限制单张图像大小
+                    if (imgDataSize > 10 * 1024 * 1024) {
+                        auditLog(LOG_LEVELS.WARN, 'image_data_too_large', { imgDataSize });
+                        break;
+                    }
+                    const imgData = payload.buffer.slice(
+                        payload.byteOffset + 8,
+                        payload.byteOffset + 8 + imgDataSize
+                    );
+                    imageCache.putSlot(imgSlotId, imgData);
+                    // 如果有附加哈希，也存入哈希缓存
+                    if (8 + imgDataSize + 32 <= payLen) {
+                        const hashBytes = new Uint8Array(
+                            payload.buffer, payload.byteOffset + 8 + imgDataSize, 32
+                        );
+                        const hexHash = bytesToHex(hashBytes);
+                        imageCache.put(hexHash, imgData);
+                    }
+                }
+                break;
+            case OP.DRAW_SCROLLBAR:
+                {
+                    // 负载格式: rect(16B) + vertical(1B) + position(f32) + thumb_size(f32) = 25B
+                    if (payLen < 25) {
+                        auditLog(LOG_LEVELS.WARN, 'draw_scrollbar_payload_too_short', { payLen });
+                        break;
+                    }
+                    const sbRect = readRect(payload, 0);
+                    const sbVertical = payload.getUint8(16) !== 0;
+                    const sbPosition = payload.getFloat32(17, true);
+                    const sbThumbSize = payload.getFloat32(21, true);
+                    // 绘制滚动条轨道和滑块
+                    const trackPaint = new CanvasKit.Paint();
+                    trackPaint.setColor(CanvasKit.Color(0, 0, 0, 0.15));
+                    trackPaint.setStyle(CanvasKit.PaintStyle.Fill);
+                    trackPaint.setAntiAlias(true);
+                    skCanvas.drawRect(sbRect, trackPaint);
+                    trackPaint.delete();
+                    // 绘制滑块
+                    const thumbPaint = new CanvasKit.Paint();
+                    thumbPaint.setColor(CanvasKit.Color(0.4, 0.4, 0.4, 0.8));
+                    thumbPaint.setStyle(CanvasKit.PaintStyle.Fill);
+                    thumbPaint.setAntiAlias(true);
+                    if (sbVertical) {
+                        const thumbH = sbRect[3] - sbRect[1];
+                        const thumbTop = sbRect[1] + sbPosition * thumbH;
+                        const thumbBottom = Math.min(sbRect[3], thumbTop + sbThumbSize * thumbH);
+                        const thumbRect = new CanvasKit.LTRBRect(sbRect[0], thumbTop, sbRect[2], thumbBottom);
+                        skCanvas.drawRRect(
+                            new CanvasKit.RRect(thumbRect, 2, 2, 2, 2),
+                            thumbPaint
+                        );
+                    } else {
+                        const thumbW = sbRect[2] - sbRect[0];
+                        const thumbLeft = sbRect[0] + sbPosition * thumbW;
+                        const thumbRight = Math.min(sbRect[2], thumbLeft + sbThumbSize * thumbW);
+                        const thumbRect = new CanvasKit.LTRBRect(thumbLeft, sbRect[1], thumbRight, sbRect[3]);
+                        skCanvas.drawRRect(
+                            new CanvasKit.RRect(thumbRect, 2, 2, 2, 2),
+                            thumbPaint
+                        );
+                    }
+                    thumbPaint.delete();
+                }
                 break;
             case OP.NOOP:
                 break;
@@ -905,7 +1045,51 @@ import {
      * @param {number} offset - Paint 数据在 payload 中的起始偏移
      * @returns {object} CanvasKit Paint 对象
      */
+    function readSamplingOptions(payload, offset, payLen) {
+        // 协议格式 (与 C++ writeSamplingOptions 一致):
+        //   useCubic(1B) + if useCubic: B(f32)+C(f32)=8B, else: filter(1B)+mipmap(1B)=2B
+        // 返回 { sampling, nextOffset } 或 null (边界错误)
+        if (offset + 1 > payLen) {
+            auditLog(LOG_LEVELS.WARN, 'readSamplingOptions_useCubic_bounds', { offset, payLen });
+            return null;
+        }
+        const useCubic = payload.getUint8(offset);
+        let nextOffset = offset + 1;
+        let sampling;
+
+        if (useCubic) {
+            // Cubic: B(f32) + C(f32) = 8B
+            if (nextOffset + 8 > payLen) {
+                auditLog(LOG_LEVELS.WARN, 'readSamplingOptions_cubic_bounds', { nextOffset, payLen });
+                return null;
+            }
+            const B = payload.getFloat32(nextOffset, true);
+            const C = payload.getFloat32(nextOffset + 4, true);
+            nextOffset += 8;
+            sampling = { useCubic: true, B, C };
+        } else {
+            // Non-cubic: filter(1B) + mipmap(1B) = 2B
+            if (nextOffset + 2 > payLen) {
+                auditLog(LOG_LEVELS.WARN, 'readSamplingOptions_filter_bounds', { nextOffset, payLen });
+                return null;
+            }
+            const filter = payload.getUint8(nextOffset);
+            const mipmap = payload.getUint8(nextOffset + 1);
+            nextOffset += 2;
+            sampling = { useCubic: false, filter, mipmap };
+        }
+        return { sampling, nextOffset };
+    }
+
     function readPaint(payload, offset) {
+        // 边界检查: Paint 最小 22 字节
+        // 18B 固定头 + 1B hasShader + 1B hasMask + 1B hasColorFilter + 1B hasImageFilter
+        // (所有 has* 标志为 0 时的最小大小)
+        if (offset + 22 > payload.byteLength) {
+            auditLog(LOG_LEVELS.WARN, 'readPaint_bounds_exceeded', { offset, byteLength: payload.byteLength });
+            return null;
+        }
+
         const paint = new canvasKit.Paint();
 
         // ── Color: uint32 RGBA 解包为 [r,g,b,a] 0-1 浮点数组 ──
@@ -1006,11 +1190,24 @@ import {
             return { shader: null, bytesRead: 1 };
         }
 
+        // 边界检查: header + tileMode + colorCount + pad
+        if (offset + headerSize > payload.byteLength) {
+            auditLog(LOG_LEVELS.WARN, 'readShader_header_bounds', { offset, headerSize, byteLength: payload.byteLength });
+            return { shader: null, bytesRead: 1 };
+        }
+
         // 读取 tileMode 和 colorCount (在 header 末尾前)
         // header 结构: [几何参数...] + tileMode(1B) + colorCount(1B) + _pad(2B)
         // tileMode 在 headerSize-4, colorCount 在 headerSize-3 (与 validator 一致)
         const tileMode = payload.getUint8(offset + headerSize - 4);
         const colorCount = payload.getUint8(offset + headerSize - 3);
+
+        // 边界检查: color stops (每个 8B)
+        const colorStopsEnd = offset + headerSize + colorCount * 8;
+        if (colorStopsEnd > payload.byteLength) {
+            auditLog(LOG_LEVELS.WARN, 'readShader_colorstops_bounds', { colorCount, colorStopsEnd, byteLength: payload.byteLength });
+            return { shader: null, bytesRead: 1 };
+        }
 
         // 读取颜色停止点
         const colors = [];
@@ -1097,134 +1294,446 @@ import {
     }
 
     function readPath(payload, offset) {
+        // Protocol format (matches C++ writePath):
+        //   verbCount(u32) + pointCount(u32) + verbs[u8*verbCount] + points[f32*2*pointCount] + conicWeights[f32*conicCount]
+        //   Verb values: 0=move, 1=line, 2=quad, 3=conic, 4=cubic, 5=close
+        //   conicCount = number of kConic verbs (weights written after points)
+        if (offset + 8 > payload.byteLength) {
+            auditLog(LOG_LEVELS.WARN, 'readPath_header_bounds', { offset, byteLength: payload.byteLength });
+            return new canvasKit.Path();
+        }
         const verbCount = payload.getUint32(offset, true);
         const pointCount = payload.getUint32(offset + 4, true);
-        const path = new canvasKit.Path();
+        if (verbCount > 100000 || pointCount > 1000000) {
+            auditLog(LOG_LEVELS.WARN, 'readPath_oversized', { verbCount, pointCount });
+            return new canvasKit.Path();
+        }
 
-        let pos = offset + 8;
+        const verbsStart = offset + 8;
+        const verbsEnd = verbsStart + verbCount;
+        const pointsEnd = verbsEnd + pointCount * 8;
+        if (pointsEnd > payload.byteLength) {
+            auditLog(LOG_LEVELS.WARN, 'readPath_data_bounds', {
+                verbCount, pointCount, pointsEnd, byteLength: payload.byteLength
+            });
+            return new canvasKit.Path();
+        }
+
+        const verbs = new Uint8Array(payload.buffer, payload.byteOffset + verbsStart, verbCount);
+        const points = new Float32Array(payload.buffer, payload.byteOffset + verbsEnd, pointCount * 2);
+
+        // Count conic verbs to know how many weights to read
+        let conicCount = 0;
         for (let i = 0; i < verbCount; i++) {
-            const verb = payload.getUint8(pos);
-            pos += 1;
+            if (verbs[i] === 3) conicCount++;  // 3 = kConic
+        }
 
+        // Read conic weights (written after points array)
+        const weightsStart = pointsEnd;
+        const weightsEnd = weightsStart + conicCount * 4;
+        if (weightsEnd > payload.byteLength) {
+            auditLog(LOG_LEVELS.WARN, 'readPath_weights_bounds', {
+                conicCount, weightsEnd, byteLength: payload.byteLength
+            });
+            return new canvasKit.Path();
+        }
+        const conicWeights = new Float32Array(payload.buffer, payload.byteOffset + weightsStart, conicCount);
+
+        const path = new canvasKit.Path();
+        let ptIdx = 0;  // point index (each point = 2 floats)
+        let weightIdx = 0;  // conic weight index
+        for (let i = 0; i < verbCount; i++) {
+            const verb = verbs[i];
             switch (verb) {
-                case 0: // moveTo
-                    path.moveTo(
-                        payload.getFloat32(pos, true),
-                        payload.getFloat32(pos + 4, true)
-                    );
-                    pos += 8;
+                case 0: // moveTo - 1 point
+                    path.moveTo(points[ptIdx], points[ptIdx + 1]);
+                    ptIdx += 2;
                     break;
-                case 1: // lineTo
-                    path.lineTo(
-                        payload.getFloat32(pos, true),
-                        payload.getFloat32(pos + 4, true)
-                    );
-                    pos += 8;
+                case 1: // lineTo - 1 point
+                    path.lineTo(points[ptIdx], points[ptIdx + 1]);
+                    ptIdx += 2;
                     break;
-                case 2: // quadTo
+                case 2: // quadTo - 2 points
                     path.quadTo(
-                        payload.getFloat32(pos, true),
-                        payload.getFloat32(pos + 4, true),
-                        payload.getFloat32(pos + 8, true),
-                        payload.getFloat32(pos + 12, true)
+                        points[ptIdx], points[ptIdx + 1],
+                        points[ptIdx + 2], points[ptIdx + 3]
                     );
-                    pos += 16;
+                    ptIdx += 4;
                     break;
-                case 3: // conicTo
+                case 3: // conicTo - 2 points + 1 weight
                     path.conicTo(
-                        payload.getFloat32(pos, true),
-                        payload.getFloat32(pos + 4, true),
-                        payload.getFloat32(pos + 8, true),
-                        payload.getFloat32(pos + 12, true),
-                        payload.getFloat32(pos + 16, true)
+                        points[ptIdx], points[ptIdx + 1],
+                        points[ptIdx + 2], points[ptIdx + 3],
+                        conicWeights[weightIdx]
                     );
-                    pos += 20;
+                    ptIdx += 4;
+                    weightIdx++;
                     break;
-                case 4: // cubicTo
+                case 4: // cubicTo - 3 points
                     path.cubicTo(
-                        payload.getFloat32(pos, true),
-                        payload.getFloat32(pos + 4, true),
-                        payload.getFloat32(pos + 8, true),
-                        payload.getFloat32(pos + 12, true),
-                        payload.getFloat32(pos + 16, true),
-                        payload.getFloat32(pos + 20, true)
+                        points[ptIdx], points[ptIdx + 1],
+                        points[ptIdx + 2], points[ptIdx + 3],
+                        points[ptIdx + 4], points[ptIdx + 5]
                     );
-                    pos += 24;
+                    ptIdx += 6;
                     break;
-                case 5: // close
+                case 5: // close - 0 points
                     path.close();
+                    break;
+                default:
+                    auditLog(LOG_LEVELS.WARN, 'readPath_unknown_verb', { verb, i });
                     break;
             }
         }
-
         return path;
     }
 
     function drawImageInline(payload, payLen) {
+        // 协议格式 (与 C++ writeImage + drawImage 一致):
+        //   flag(1B): 0x00=inline, 0x01=hash-ref
+        //   if inline: slot_id(4B)  (hash 不在 inline 模式下传输)
+        //   if hash-ref: hash(32B)
+        //   left(f32) + top(f32) = 8B
+        //   sampling(1B)
+        //   paint_presence(1B) + [paint(N)]
+        if (payLen < 1) return;
         const flag = payload.getUint8(0);
+        let off = 1;
+        let img = null;
+        let imgOwned = false;
+
         if (flag === 0x01) {
-            // hash-ref 引用
-            // 读取 32 字节哈希，从 ImageCache 获取
+            // hash-ref 引用: flag(1) + hash(32) + left(4) + top(4) + ...
+            if (payLen < 41) {
+                auditLog(LOG_LEVELS.WARN, 'drawImage_hashref_too_short', { payLen });
+                return;
+            }
             const hashBytes = new Uint8Array(payload.buffer, payload.byteOffset + 1, 32);
             const hexHash = bytesToHex(hashBytes);
             const imageData = imageCache.get(hexHash);
             if (imageData) {
-                const img = canvasKit.MakeImageFromEncoded(imageData);
-                if (img) {
-                    const x = payload.getFloat32(33, true);
-                    const y = payload.getFloat32(37, true);
-                    skCanvas.drawImage(img, x, y);
-                    img.delete();
+                img = canvasKit.MakeImageFromEncoded(imageData);
+                imgOwned = true;
+                if (!img) {
+                    auditLog(LOG_LEVELS.WARN, 'drawImage_hashref_decode_failed', { hexHash });
                 }
+            } else {
+                auditLog(LOG_LEVELS.WARN, 'drawImage_hashref_miss', { hexHash });
             }
+            off = 33;
         } else if (flag === 0x00) {
-            // inline 图像数据
-            // slot_id(4) + data_size(4) + data(N)
-            const dataSize = payload.getUint32(5, true);
-            const imgData = payload.buffer.slice(
-                payload.byteOffset + 9,
-                payload.byteOffset + 9 + dataSize
-            );
-            const img = canvasKit.MakeImageFromEncoded(imgData);
-            if (img) {
-                const x = payload.getFloat32(9 + dataSize, true);
-                const y = payload.getFloat32(13 + dataSize, true);
-                skCanvas.drawImage(img, x, y);
-                img.delete();
+            // inline: flag(1) + slot_id(4) + [hash(32) if secure] + left(4) + top(4) + ...
+            // 注意: inline 模式下图像数据通过 IMAGE_DATA opcode 单独传输
+            //       此处仅通过 slot_id 或 hash 从缓存获取
+            if (payLen < 5) {
+                auditLog(LOG_LEVELS.WARN, 'drawImage_inline_too_short', { payLen });
+                return;
             }
+            const slotId = payload.getUint32(1, true);
+            off = 5;
+            // 尝试从 slot 缓存获取图像 (通过 IMAGE_DATA 注册)
+            const slotData = imageCache.getSlot(slotId);
+            if (slotData) {
+                img = canvasKit.MakeImageFromEncoded(slotData);
+                imgOwned = true;
+                if (!img) {
+                    auditLog(LOG_LEVELS.WARN, 'drawImage_slot_decode_failed', { slotId });
+                }
+            } else {
+                auditLog(LOG_LEVELS.WARN, 'drawImage_slot_miss', { slotId });
+            }
+        } else {
+            auditLog(LOG_LEVELS.WARN, 'drawImage_unknown_flag', { flag });
+            return;
+        }
+
+        // 读取 left, top, sampling (variable length), paint
+        if (off + 9 > payLen) {
+            auditLog(LOG_LEVELS.WARN, 'drawImage_coords_too_short', { off, payLen });
+            if (imgOwned && img) img.delete();
+            return;
+        }
+        const left = payload.getFloat32(off, true);
+        const top = payload.getFloat32(off + 4, true);
+        off += 8;
+        // 读取可变长度 sampling options
+        // 格式: useCubic(1B) + if cubic: B(f32)+C(f32)=8B, else: filter(1B)+mipmap(1B)=2B
+        const samplingResult = readSamplingOptions(payload, off, payLen);
+        if (!samplingResult) {
+            if (imgOwned && img) img.delete();
+            return;
+        }
+        off = samplingResult.nextOffset;
+        // paint_presence
+        if (off + 1 > payLen) {
+            auditLog(LOG_LEVELS.WARN, 'drawImage_paint_presence_bounds', { off, payLen });
+            if (imgOwned && img) img.delete();
+            return;
+        }
+        const hasPaint = payload.getUint8(off);
+        off += 1;
+
+        let paint = null;
+        if (hasPaint) {
+            paint = readPaint(payload, off);
+        }
+
+        if (img) {
+            if (paint) {
+                skCanvas.drawImage(img, left, top, paint);
+                paint.delete();
+            } else {
+                skCanvas.drawImage(img, left, top);
+            }
+            img.delete();
         }
     }
 
     function drawImageRectInline(payload, payLen) {
-        // 类似 drawImage，额外包含 src/dst rect
-        // 简化版：委托给 drawImage（完整版需要处理 rect 参数）
-        drawImageInline(payload, payLen);
-    }
+        // 协议格式 (与 C++ drawImageRect 一致):
+        //   writeImage: flag(1B) + slot_id(4B)/hash(32B)
+        //   src_rect(16B) + dst_rect(16B)
+        //   sampling(variable: 3B or 9B)
+        //   paint_presence(1B) + [paint(N)]
+        //   constraint(1B)
+        if (payLen < 1) return;
+        const flag = payload.getUint8(0);
+        let off = 1;
+        let img = null;
+        let imgOwned = false;
 
-    function drawTextBlob(payload, payLen) {
-        const x = payload.getFloat32(0, true);
-        const y = payload.getFloat32(4, true);
-        const glyphCount = payload.getUint32(8, true);
+        if (flag === 0x01) {
+            // hash-ref: flag(1) + hash(32) + src(16) + dst(16) + ...
+            if (payLen < 65) {
+                auditLog(LOG_LEVELS.WARN, 'drawImageRect_hashref_too_short', { payLen });
+                return;
+            }
+            const hashBytes = new Uint8Array(payload.buffer, payload.byteOffset + 1, 32);
+            const hexHash = bytesToHex(hashBytes);
+            const imageData = imageCache.get(hexHash);
+            if (imageData) {
+                img = canvasKit.MakeImageFromEncoded(imageData);
+                imgOwned = true;
+            } else {
+                auditLog(LOG_LEVELS.WARN, 'drawImageRect_hashref_miss', { hexHash });
+            }
+            off = 33;
+        } else if (flag === 0x00) {
+            // inline: flag(1) + slot_id(4) + src(16) + dst(16) + ...
+            if (payLen < 37) {
+                auditLog(LOG_LEVELS.WARN, 'drawImageRect_inline_too_short', { payLen });
+                return;
+            }
+            const slotId = payload.getUint32(1, true);
+            off = 5;
+            const slotData = imageCache.getSlot(slotId);
+            if (slotData) {
+                img = canvasKit.MakeImageFromEncoded(slotData);
+                imgOwned = true;
+            } else {
+                auditLog(LOG_LEVELS.WARN, 'drawImageRect_slot_miss', { slotId });
+            }
+        } else {
+            return;
+        }
 
-        const builder = canvasKit.TextBlob.MakeFromGlyphs(
-            // glyph IDs
-            new Uint16Array(payload.buffer, payload.byteOffset + 12, glyphCount),
-            // positions (x,y pairs)
-            new Float32Array(payload.buffer, payload.byteOffset + 12 + glyphCount * 2, glyphCount * 2),
-            // 使用当前活跃字体（FONT_DATA 设置，回退为 fontId=0）
-            fontRegistry.getTypeface(currentFontId)
-        );
+        // 读取 src_rect, dst_rect
+        if (off + 32 > payLen) {
+            auditLog(LOG_LEVELS.WARN, 'drawImageRect_rects_too_short', { off, payLen });
+            if (imgOwned && img) img.delete();
+            return;
+        }
+        const srcRect = readRect(payload, off);
+        const dstRect = readRect(payload, off + 16);
+        off += 32;
 
-        if (builder) {
-            const paint = readPaint(payload, 12 + glyphCount * 10);
-            skCanvas.drawTextBlob(builder, x, y, paint);
-            paint.delete();
+        // 读取可变长度 sampling options
+        const samplingResult = readSamplingOptions(payload, off, payLen);
+        if (!samplingResult) {
+            if (imgOwned && img) img.delete();
+            return;
+        }
+        off = samplingResult.nextOffset;
+
+        // paint_presence
+        if (off + 1 > payLen) {
+            auditLog(LOG_LEVELS.WARN, 'drawImageRect_paint_presence_bounds', { off, payLen });
+            if (imgOwned && img) img.delete();
+            return;
+        }
+        const hasPaint = payload.getUint8(off);
+        off += 1;
+
+        let paint = null;
+        if (hasPaint) {
+            paint = readPaint(payload, off);
+        }
+
+        // constraint (1B) - 读取但不使用（CanvasKit 自动处理）
+        if (off + 1 > payLen) {
+            auditLog(LOG_LEVELS.WARN, 'drawImageRect_constraint_bounds', { off, payLen });
+            if (paint) paint.delete();
+            if (imgOwned && img) img.delete();
+            return;
+        }
+
+        if (img) {
+            const src = new CanvasKit.LTRBRect(srcRect[0], srcRect[1], srcRect[2], srcRect[3]);
+            const dst = new CanvasKit.LTRBRect(dstRect[0], dstRect[1], dstRect[2], dstRect[3]);
+            if (paint) {
+                skCanvas.drawImageRect(img, src, dst, paint);
+                paint.delete();
+            } else {
+                const defaultPaint = new CanvasKit.Paint();
+                skCanvas.drawImageRect(img, src, dst, defaultPaint);
+                defaultPaint.delete();
+            }
+            src.delete();
+            dst.delete();
+            img.delete();
         }
     }
 
+    function drawTextBlob(payload, payLen) {
+        // Protocol format (matches C++ drawTextBlob, opcode kDrawTextBlob=0x50):
+        //   x(f32) + y(f32) + runCount(u32) + [fontId(u32) + glyphCount(u32) + glyphs(u16*N) + positions(f32*2*N)]*runCount + paint(N)
+        // 边界检查: x(4) + y(4) + runCount(4) = 12B header
+        if (payLen < 12) {
+            auditLog(LOG_LEVELS.WARN, 'drawTextBlob_too_short', { payLen });
+            return;
+        }
+        const x = payload.getFloat32(0, true);
+        const y = payload.getFloat32(4, true);
+        let off = 8;
+        const runCount = payload.getUint32(off, true);
+        off += 4;
+        if (runCount > 256) {
+            auditLog(LOG_LEVELS.WARN, 'drawTextBlob_too_many_runs', { runCount });
+            return;
+        }
+        if (runCount === 0) {
+            auditLog(LOG_LEVELS.WARN, 'drawTextBlob_zero_runs');
+            return;
+        }
+
+        // Process each run, accumulate glyphs/positions for the last run's paint
+        let lastBuilder = null;
+        for (let r = 0; r < runCount; r++) {
+            // Bounds check: fontId(4) + glyphCount(4) = 8B
+            if (off + 8 > payLen) {
+                auditLog(LOG_LEVELS.WARN, 'drawTextBlob_run_header_bounds', { off, r, payLen });
+                if (lastBuilder) lastBuilder.delete();
+                return;
+            }
+            const fontId = payload.getUint32(off, true);
+            off += 4;
+            const glyphCount = payload.getUint32(off, true);
+            off += 4;
+
+            // Bounds check: glyphs(2*N) + positions(8*N)
+            const glyphsEnd = off + glyphCount * 2;
+            const positionsEnd = glyphsEnd + glyphCount * 8;
+            if (positionsEnd > payLen) {
+                auditLog(LOG_LEVELS.WARN, 'drawTextBlob_run_data_bounds', { glyphCount, positionsEnd, payLen });
+                if (lastBuilder) lastBuilder.delete();
+                return;
+            }
+
+            // Read glyphs and positions
+            const glyphs = new Uint16Array(payload.buffer, payload.byteOffset + off, glyphCount);
+            const positions = new Float32Array(payload.buffer, payload.byteOffset + glyphsEnd, glyphCount * 2);
+            off = positionsEnd;
+
+            // Build TextBlob from this run
+            const typeface = fontRegistry.getTypeface(fontId);
+            if (typeface && glyphCount > 0) {
+                const builder = canvasKit.TextBlob.MakeFromGlyphs(glyphs, positions, typeface);
+                if (builder) {
+                    if (lastBuilder) lastBuilder.delete();
+                    lastBuilder = builder;
+                }
+            }
+        }
+
+        // Read paint after all runs (C++ writes paint once after writeTextBlob)
+        if (lastBuilder) {
+            const paint = readPaint(payload, off);
+            if (paint) {
+                skCanvas.drawTextBlob(lastBuilder, x, y, paint);
+                paint.delete();
+            } else {
+                const defaultPaint = new canvasKit.Paint();
+                skCanvas.drawTextBlob(lastBuilder, x, y, defaultPaint);
+                defaultPaint.delete();
+            }
+            lastBuilder.delete();
+        }
+    }
+
+    function drawGlyphRunList(payload, payLen) {
+        // Protocol format (matches C++ drawGlyphRunList, opcode kDrawGlyphRunList=0x51):
+        //   runCount(u32) + [fontId(u32) + glyphCount(u32) + glyphs(u16*N) + positions(f32*2*N)]*runCount
+        // 注意: 此 opcode 不含 x/y 坐标和 paint，使用默认 paint 在 (0,0) 绘制
+        if (payLen < 4) {
+            auditLog(LOG_LEVELS.WARN, 'drawGlyphRunList_too_short', { payLen });
+            return;
+        }
+        let off = 0;
+        const runCount = payload.getUint32(off, true);
+        off += 4;
+        if (runCount > 256) {
+            auditLog(LOG_LEVELS.WARN, 'drawGlyphRunList_too_many_runs', { runCount });
+            return;
+        }
+        if (runCount === 0) return;
+
+        const defaultPaint = new canvasKit.Paint();
+        for (let r = 0; r < runCount; r++) {
+            if (off + 8 > payLen) {
+                auditLog(LOG_LEVELS.WARN, 'drawGlyphRunList_run_header_bounds', { off, r, payLen });
+                break;
+            }
+            const fontId = payload.getUint32(off, true);
+            off += 4;
+            const glyphCount = payload.getUint32(off, true);
+            off += 4;
+
+            const glyphsEnd = off + glyphCount * 2;
+            const positionsEnd = glyphsEnd + glyphCount * 8;
+            if (positionsEnd > payLen) {
+                auditLog(LOG_LEVELS.WARN, 'drawGlyphRunList_run_data_bounds', { glyphCount, positionsEnd, payLen });
+                break;
+            }
+
+            const glyphs = new Uint16Array(payload.buffer, payload.byteOffset + off, glyphCount);
+            const positions = new Float32Array(payload.buffer, payload.byteOffset + glyphsEnd, glyphCount * 2);
+            off = positionsEnd;
+
+            const typeface = fontRegistry.getTypeface(fontId);
+            if (typeface && glyphCount > 0) {
+                const builder = canvasKit.TextBlob.MakeFromGlyphs(glyphs, positions, typeface);
+                if (builder) {
+                    skCanvas.drawTextBlob(builder, 0, 0, defaultPaint);
+                    builder.delete();
+                }
+            }
+        }
+        defaultPaint.delete();
+    }
+
     function handleFontData(payload, payLen) {
+        // 边界检查: fontId(4) + fontSize(4) = 8B header
+        if (payLen < 8) {
+            auditLog(LOG_LEVELS.WARN, 'handleFontData_too_short', { payLen });
+            return;
+        }
         const fontId = payload.getUint32(0, true);
         const fontSize = payload.getUint32(4, true);
+        // 边界检查: font data 不得超出 payload
+        if (8 + fontSize > payLen) {
+            auditLog(LOG_LEVELS.WARN, 'handleFontData_exceeds_payload', { fontSize, payLen });
+            return;
+        }
         const fontData = payload.buffer.slice(
             payload.byteOffset + 8,
             payload.byteOffset + 8 + fontSize
@@ -1586,8 +2095,10 @@ import {
      * @returns {string} HTML 转义后的安全字符串
      */
     function escapeHtml(str) {
+        // 强制转换为字符串，防止 undefined/null/对象导致意外行为
+        const s = (str === null || str === undefined) ? '' : String(str);
         const div = document.createElement('div');
-        div.textContent = str;  // textContent 自动转义 HTML 实体
+        div.textContent = s;  // textContent 自动转义 HTML 实体
         return div.innerHTML;
     }
 

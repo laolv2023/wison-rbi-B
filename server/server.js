@@ -79,6 +79,9 @@ const {
     TLS_CIPHER_SUITE,
     TLS_MIN_VERSION,
     TLS_HONOR_CIPHER_ORDER,
+    MAX_CONCURRENT_SESSIONS,
+    RATE_LIMIT_MESSAGES_PER_SEC,
+    RATE_LIMIT_BURST,
 } = require('./config');
 
 // ═══════════════════════════════════════════════════════════════
@@ -101,6 +104,7 @@ class WisonRBIServer {
         this._port = options.port || 3000;
         this._chromiumPath = options.chromiumPath || 'chromium';
         this._maxSessions = options.maxSessions || 4;
+        this._isShuttingDown = false;  // 幂等关闭标志
 
         // ── TLS 配置 (§2.1, Phase 3 安全加固) ──
         // TLS 1.3 + AEAD 密码套件强制
@@ -253,6 +257,9 @@ class WisonRBIServer {
      * @returns {Promise<void>}
      */
     async shutdown() {
+        // 幂等保护: 防止 SIGTERM+SIGINT 同时触发导致双重关闭
+        if (this._isShuttingDown) return;
+        this._isShuttingDown = true;
         console.log('[server] Shutting down...');
 
         // 关闭所有 WebSocket 连接
@@ -261,8 +268,15 @@ class WisonRBIServer {
         }
         this._sessions.clear();
 
-        // 关闭所有 Chromium 实例
-        await this._chromiumPool.shutdown();
+        // 关闭所有 Chromium 实例（带 10 秒超时保护）
+        try {
+            await Promise.race([
+                this._chromiumPool.shutdown(),
+                new Promise((_, reject) => setTimeout(() => reject(new Error('shutdown timeout')), 10000))
+            ]);
+        } catch (err) {
+            console.error('[server] Chromium shutdown error:', err.message);
+        }
 
         // 关闭 HTTP Server
         this._wsServer.close();
@@ -293,8 +307,16 @@ class WisonRBIServer {
      * @param {http.IncomingMessage} req - HTTP 升级请求
      */
     async _onConnection(ws, req) {
+        // 连接数限制: 防止 DoS
+        if (this._sessions.size >= MAX_CONCURRENT_SESSIONS) {
+            console.warn(`[server] Connection rejected: max sessions (${MAX_CONCURRENT_SESSIONS}) reached`);
+            ws.close(1013, 'Maximum sessions reached');
+            return;
+        }
+
         const sessionId = uuidv4();
-        console.log(`[server] New connection: ${sessionId} (from ${req.socket.remoteAddress})`);
+        const clientIp = req.socket.remoteAddress;
+        console.log(`[server] New connection: ${sessionId} (from ${clientIp})`);
 
         // Phase 5: 指标记录
         metrics.setGauge(SESSIONS_ACTIVE, this._sessions.size + 1);
@@ -304,6 +326,10 @@ class WisonRBIServer {
         // 创建会话 — 初始状态为活跃
         const session = new Session(sessionId);
         session.socket = ws;
+        session._clientIp = clientIp;
+        // 速率限制: 令牌桶
+        session._rateLimitTokens = RATE_LIMIT_BURST;
+        session._rateLimitLastRefill = Date.now();
         this._sessions.set(sessionId, session);
 
         let inputProxy = null;
@@ -335,6 +361,18 @@ class WisonRBIServer {
         // ── 消息处理 ──
         // 客户端发送的 JSON 消息在此路由
         ws.on('message', async (data) => {
+            // 速率限制: 令牌桶算法
+            const now = Date.now();
+            const elapsed = now - session._rateLimitLastRefill;
+            const refill = Math.floor(elapsed * RATE_LIMIT_MESSAGES_PER_SEC / 1000);
+            session._rateLimitTokens = Math.min(RATE_LIMIT_BURST, session._rateLimitTokens + refill);
+            session._rateLimitLastRefill = now;
+            if (session._rateLimitTokens <= 0) {
+                console.warn(`[server] Rate limit exceeded for ${sessionId} (IP: ${session._clientIp})`);
+                return;  // 丢弃消息
+            }
+            session._rateLimitTokens--;
+
             try {
                 const msg = JSON.parse(data.toString());
                 await this._handleMessage(session, inputProxy, msg);
@@ -350,30 +388,32 @@ class WisonRBIServer {
         });
 
         // ── 连接关闭 ──
-        ws.on('close', (code, reason) => {
-            console.log(`[server] Connection closed: ${sessionId} (code=${code})`);
-            // 清理背压监控定时器
+        // 使用 _connectionClosed 标志防止 close+error 双重清理
+        let _connectionClosed = false;
+        const cleanupConnection = () => {
+            if (_connectionClosed) return;
+            _connectionClosed = true;
             clearInterval(backpressureInterval);
-            session.close();
-            this._sessions.delete(sessionId);
-            metrics.decGauge(SESSIONS_ACTIVE);
-            // 释放 Chromium 实例回池
+            try { session.close(); } catch (e) { /* 忽略 */ }
+            if (this._sessions.has(sessionId)) {
+                this._sessions.delete(sessionId);
+                metrics.decGauge(SESSIONS_ACTIVE);
+            }
             this._chromiumPool.release(sessionId).catch(err => {
                 console.error(`[server] Error releasing chromium:`, err.message);
             });
+        };
+
+        ws.on('close', (code, reason) => {
+            console.log(`[server] Connection closed: ${sessionId} (code=${code})`);
+            cleanupConnection();
         });
 
         // ── 错误处理 ──
         ws.on('error', (err) => {
             console.error(`[server] WebSocket error for ${sessionId}:`, err.message);
             metrics.counter(WS_ERRORS);
-            // 错误时关闭会话释放资源，防止僵尸会话累积
-            session.close();
-            this._sessions.delete(sessionId);
-            metrics.decGauge(SESSIONS_ACTIVE);
-            this._chromiumPool.release(sessionId).catch(releaseErr => {
-                console.error(`[server] Error releasing chromium on ws error:`, releaseErr.message);
-            });
+            cleanupConnection();
         });
 
         // ── 背压监控 (§4 / §8) ──
@@ -493,6 +533,61 @@ class WisonRBIServer {
         if (!/^https?:\/\//i.test(url) && url !== 'about:blank') {
             console.warn(`[server] Rejected non-web URL: ${url}`);
             url = 'about:blank';
+        }
+        // SSRF 防御: 拒绝内网地址（localhost, 127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16）
+        if (url !== 'about:blank') {
+            try {
+                const parsed = new URL(url);
+                const hostname = parsed.hostname.toLowerCase();
+                // 防御十进制/十六进制 IP 绕过: 尝试解析为数字 IP
+                // 例如: 2130706433 → 127.0.0.1, 0x7f000001 → 127.0.0.1
+                let resolvedHostname = hostname;
+                // 如果是纯数字，尝试转换为 IP
+                if (/^\d+$/.test(hostname)) {
+                    const num = parseInt(hostname, 10);
+                    if (num >= 0 && num <= 0xFFFFFFFF) {
+                        const a = (num >>> 24) & 0xFF;
+                        const b = (num >>> 16) & 0xFF;
+                        const c = (num >>> 8) & 0xFF;
+                        const d = num & 0xFF;
+                        resolvedHostname = `${a}.${b}.${c}.${d}`;
+                    }
+                }
+                // 如果是十六进制 IP (0x...)
+                if (/^0x[0-9a-f]+$/i.test(hostname)) {
+                    const num = parseInt(hostname, 16);
+                    if (num >= 0 && num <= 0xFFFFFFFF) {
+                        const a = (num >>> 24) & 0xFF;
+                        const b = (num >>> 16) & 0xFF;
+                        const c = (num >>> 8) & 0xFF;
+                        const d = num & 0xFF;
+                        resolvedHostname = `${a}.${b}.${c}.${d}`;
+                    }
+                }
+                const blockedPatterns = [
+                    /^localhost$/,
+                    /^127\./,
+                    /^10\./,
+                    /^172\.(1[6-9]|2[0-9]|3[01])\./,
+                    /^192\.168\./,
+                    /^169\.254\./,
+                    /^0\./,
+                    /^::1$/,
+                    /^fc00:/,
+                    /^fe80:/,
+                    /^\[::1\]$/
+                ];
+                for (const pattern of blockedPatterns) {
+                    if (pattern.test(resolvedHostname) || pattern.test(hostname)) {
+                        console.warn(`[server] Rejected internal URL (SSRF protection): ${url} (hostname=${hostname}, resolved=${resolvedHostname})`);
+                        url = 'about:blank';
+                        break;
+                    }
+                }
+            } catch (e) {
+                console.warn(`[server] Invalid URL rejected: ${url}`);
+                url = 'about:blank';
+            }
         }
         console.log(`[server] Session ${session.sessionId} navigating to: ${url}`);
 

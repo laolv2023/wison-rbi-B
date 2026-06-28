@@ -106,6 +106,16 @@ module.exports = Object.freeze({
     //   超出时触发背压检测，丢弃非关键帧以保证低延迟。
     WS_HIGH_WATER_MARK: 1 * 1024 * 1024,                 // 1 MB
 
+    // ── 连接限制 (DoS 防护) ──
+    // MAX_CONCURRENT_SESSIONS: 最大并发会话数。超出时拒绝新连接。
+    //   防止攻击者通过海量连接耗尽 Chromium 实例池。
+    MAX_CONCURRENT_SESSIONS: 100,
+    // RATE_LIMIT_MESSAGES_PER_SEC: 每客户端每秒最大消息数。
+    //   超出时丢弃消息并警告，防止消息洪水。
+    RATE_LIMIT_MESSAGES_PER_SEC: 100,
+    // RATE_LIMIT_BURST: 令牌桶突发上限。
+    RATE_LIMIT_BURST: 200,
+
     // ── 帧头偏移常量 (§6.1) ──
     FRAME_HEADER_SIZE: 30,     // 帧头固定 30 字节
     FRAME_TRAILER_SIZE: 4,     // 帧尾: CRC32 (uint32 LE)

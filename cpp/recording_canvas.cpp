@@ -126,18 +126,16 @@ void RecordingCanvas::restore() {
 }
 
 int RecordingCanvas::saveLayer(const SkRect* bounds, const SkPaint* paint) {
-    // FIX-H2: protocol with presence bytes before each optional field
+    // Protocol: bounds_presence(1B) + [bounds(16B)] + paint_presence(1B) + [paint(N)]
+    // When presence=0, the field is omitted entirely (no zero-fill).
     safeCommand(Opcode::kSaveLayer, [&]() {
         save_depth_++;
-        // bounds presence byte + conditional rect
+        // bounds presence byte + conditional rect (omitted when absent)
         buffer_.writeU8(bounds ? 1 : 0);
         if (bounds) {
             buffer_.writeRect(*bounds);
-        } else {
-            SkRect zero{0.0f, 0.0f, 0.0f, 0.0f};
-            buffer_.writeRect(zero);
         }
-        // paint presence byte + conditional paint
+        // paint presence byte + conditional paint (omitted when absent)
         buffer_.writeU8(paint ? 1 : 0);
         if (paint) {
             buffer_.writePaint(*paint);
@@ -263,10 +261,10 @@ void RecordingCanvas::drawArc(const SkRect& oval, SkScalar startAngle,
 void RecordingCanvas::drawPath(const SkPath& path, const SkPaint& paint) {
     // FIX-H3: early bounds check on verb/point count
     if (static_cast<uint32_t>(path.countVerbs()) > kMaxPathVerbs ||
-        static_cast<uint32_t>(path.countPoints()) > kMaxPathVerbs) {
+        static_cast<uint32_t>(path.countPoints()) > kMaxPathPoints) {
         fprintf(stderr, "[RecordingCanvas] drawPath: verbCount=%d or pointCount=%d "
-                "exceeds kMaxPathVerbs=%u\n",
-                path.countVerbs(), path.countPoints(), kMaxPathVerbs);
+                "exceeds limits (verbs=%u, points=%u)\n",
+                path.countVerbs(), path.countPoints(), kMaxPathVerbs, kMaxPathPoints);
         return;
     }
     safeCommand(Opcode::kDrawPath, [&]() {
@@ -366,11 +364,10 @@ void RecordingCanvas::drawImageLattice(const SkImage* image,
         return;
     }
     // FIX-R8a: lattice count bounds check
-    if (lattice.fXCount < 0 || lattice.fYCount < 0 || 
-        lattice.fXCount > 10000 || lattice.fYCount > 10000) {
-        if (!recording_ || finalized_) return;
-        buffer_.beginCommand(Opcode::kNoop);
-        buffer_.endCommand();
+    if (lattice.fXCount < 0 || lattice.fYCount < 0 ||
+        static_cast<uint32_t>(lattice.fXCount) > kMaxLatticeCount ||
+        static_cast<uint32_t>(lattice.fYCount) > kMaxLatticeCount) {
+        safeCommand(Opcode::kNoop, [&]() {});
         return;
     }
     safeCommand(Opcode::kDrawImageLattice, [&]() {
@@ -559,8 +556,8 @@ void RecordingCanvas::drawEdgeAAImageSet(
         return;
     }
 
-    // FIX-R8b: count upper bound (kMaxImageSetCount)
-    if (count > 10000) {  // kMaxImageSetCount
+    // count upper bound check
+    if (static_cast<uint32_t>(count) > kMaxImageSetCount) {
         safeCommand(Opcode::kNoop, [&]() {});
         return;
     }
@@ -631,8 +628,17 @@ void RecordingCanvas::drawTextBlob(const SkTextBlob* blob,
 
 void RecordingCanvas::drawGlyphRunList(const SkGlyphRunList& glyphRunList,
                                         const SkPaint& paint) {
-    // FIX-R8c: glyph run list size bounds
-    if (glyphRunList.size() > kMaxTextBlobGlyphs) {
+    // Bounds check: run count ≤ kMaxGlyphRuns, total glyph count ≤ kMaxTextBlobGlyphs
+    if (static_cast<uint32_t>(glyphRunList.size()) > kMaxGlyphRuns) {
+        safeCommand(Opcode::kNoop, [&]() {});
+        return;
+    }
+    // Pre-check total glyph count to prevent OOM
+    uint32_t totalGlyphs = 0;
+    for (auto it = glyphRunList.begin(); it != glyphRunList.end(); ++it) {
+        totalGlyphs += static_cast<uint32_t>((*it).fGlyphCount);
+    }
+    if (totalGlyphs > kMaxTextBlobGlyphs) {
         safeCommand(Opcode::kNoop, [&]() {});
         return;
     }
@@ -787,7 +793,7 @@ void RecordingCanvas::recordTextureLayer(uint32_t /*texture_id*/,
 
 void RecordingCanvas::recordVideoLayer(uint32_t /*video_frame_id*/,
            const SkRect& /*bounds*/) {
-    // v3 排除: 视频帧通过媒体通道独�[RecordingCanvas] recordVideoLayer: video layers not supported in v3, emitting NOOP\n");
+    // v3 排除: 视频帧通过媒体通道独[中文注释][RecordingCanvas] recordVideoLayer: video layers not supported in v3, emitting NOOP\n");
     safeCommand(Opcode::kNoop, [&]() {
         // no payload
     });
@@ -805,13 +811,10 @@ void RecordingCanvas::recordSurfaceLayer(uint32_t /*surface_id*/,
 void RecordingCanvas::recordScrollbarLayer(bool vertical, float position,
                                             float thumb_size,
                                             const SkRect& bounds) {
-    // 序列化滚动条信息: 使用 drawRect + 元数据
-    // 写入方向、位置、滑块大小 + 边界矩形
-    safeCommand(Opcode::kDrawRect, [&]() {
+    // 使用专用 kDrawScrollbar opcode，避免与 kDrawRect 的 Paint 负载冲突
+    // 负载格式: rect(16B) + vertical(1B) + position(f32) + thumb_size(f32) = 25B
+    safeCommand(Opcode::kDrawScrollbar, [&]() {
         buffer_.writeRect(bounds);
-        // 构建一个表示滚动条的 Paint（简单颜色填充，具体样式由客户端决定）
-        // 这里写入一个最小 Paint 描述 + 滚动条元数据作为扩展
-        // 滚动条元数据: vertical(1B) + position(f32) + thumb_size(f32)
         buffer_.writeU8(vertical ? 1 : 0);
         buffer_.writeF32(position);
         buffer_.writeF32(thumb_size);

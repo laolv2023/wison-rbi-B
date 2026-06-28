@@ -400,6 +400,13 @@ public:
     /// @see reserveImageSlot()
     void encodePendingImages();
 
+    /// @brief 将已编码的图像槽位作为 kImageData 命令追加到命令流。
+    ///
+    /// 必须在 AssembleFrame 之前调用。每个图像槽位生成一个 kImageData 命令:
+    ///   opcode(1B) + payload_len(3B) + slot_id(4B) + data_size(4B) + data(N)
+    /// 客户端通过 IMAGE_DATA 处理器接收并存入 slot 缓存。
+    void appendImageCommands();
+
     // ═══════════════════════════════════════════════════════════
     // 最终化 — 提供只读视图
     // ═══════════════════════════════════════════════════════════

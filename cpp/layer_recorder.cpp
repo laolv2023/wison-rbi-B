@@ -507,6 +507,10 @@ FrameBuffer FrameAssembler::assembleFrame(
     //    TODO(v1.6): 改为 PostTask + 回调异步编码。
     buffer.encodePendingImages();
 
+    // 将已编码的图像槽位作为 kImageData 命令追加到命令流。
+    // 必须在 AssembleFrame 之前调用，否则客户端无法收到图像数据。
+    buffer.appendImageCommands();
+
     // ── 步骤 5: 组装 FrameHeader + CommandStream + CRC32 → FrameBuffer ──
     FrameHeader header;
     header.version      = kProtocolVersion;

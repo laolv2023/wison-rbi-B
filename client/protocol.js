@@ -181,6 +181,7 @@ const PROTOCOL = Object.freeze({
         FONT_DATA:  0x70,   // 内联字体数据传输 (§8.4 P1 S4)
         IMAGE_DATA: 0x71,   // 图像 hash-ref 或内联传输 (§4.1.4)
         SET_MATRIX: 0x72,   // 直接设置 CTM 矩阵
+        DRAW_SCROLLBAR: 0x73, // 滚动条绘制 (rect + vertical + position + thumb_size)
 
         // 特殊
         NOOP: 0x7F,          // 无操作，用于对齐/批量填充

@@ -52,6 +52,8 @@ class ImageCache {
         this._accessOrder = [];     // LRU 访问顺序 (hex_hash[])
         /** @private 当前缓存占用 (字节) */
         this._currentBytes = 0;
+        /** @private Map<number, ArrayBuffer> slot_id→图像数据的映射 (inline 模式) */
+        this._slotCache = new Map(); // slot_id → ArrayBuffer
     }
 
     /**
@@ -142,6 +144,51 @@ class ImageCache {
         this._cache.clear();
         this._accessOrder = [];
         this._currentBytes = 0;
+        this._slotCache.clear();
+    }
+
+    /**
+     * 通过 slot_id 获取图像数据 (inline 模式)。
+     *
+     * @param {number} slotId - 服务端分配的槽位 ID
+     * @returns {ArrayBuffer|null} 图像二进制数据，不存在时返回 null
+     */
+    getSlot(slotId) {
+        return this._slotCache.get(slotId) || null;
+    }
+
+    /**
+     * 通过 slot_id 存储图像数据 (inline 模式)。
+     *
+     * @param {number} slotId - 服务端分配的槽位 ID
+     * @param {ArrayBuffer} imageData - 图像二进制数据
+     */
+    putSlot(slotId, imageData) {
+        // 限制 slot 缓存大小，防止内存耗尽
+        // 双重限制: 数量 ≤ 1000 且 总字节 ≤ maxBytes
+        const imgBytes = imageData ? imageData.byteLength : 0;
+        
+        // 如果单张图像就超过缓存上限，拒绝存储（防止 OOM）
+        if (imgBytes > this._maxBytes) {
+            return;
+        }
+        
+        // 计算当前 slot 缓存总字节
+        let slotBytes = 0;
+        for (const buf of this._slotCache.values()) {
+            slotBytes += buf.byteLength;
+        }
+        
+        // 淘汰直到有足够空间
+        while (this._slotCache.size > 0 && 
+               (this._slotCache.size >= 1000 || slotBytes + imgBytes > this._maxBytes)) {
+            const firstKey = this._slotCache.keys().next().value;
+            const removed = this._slotCache.get(firstKey);
+            slotBytes -= removed ? removed.byteLength : 0;
+            this._slotCache.delete(firstKey);
+        }
+        
+        this._slotCache.set(slotId, imageData);
     }
 
     /**

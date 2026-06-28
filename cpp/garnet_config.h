@@ -130,11 +130,24 @@ constexpr uint32_t kMaxCommandsPerFrame = 100000;
 /// 100,000 个点足够覆盖 SVG 复杂路径（如详细地图轮廓）。
 constexpr uint32_t kMaxPathVerbs = 100000;
 
+/// @brief drawPath 最大点数量: 300,000。
+///
+/// 安全理由: 防止 drawPath payload 中伪造 pointCount 导致 OOM。
+/// 每个 verb 最多产生 3 个点 (cubicTo)，因此 pointCount 上限为 verbCount 的 3 倍。
+/// 300,000 个点足够覆盖 SVG 复杂路径（如详细地图轮廓）。
+constexpr uint32_t kMaxPathPoints = 300000;
+
 /// @brief drawTextBlob 最大 glyph 数量: 50,000。
 ///
 /// 安全理由: 防止 drawTextBlob payload 中伪造 glyphCount 导致 OOM。
 /// 50,000 glyphs ≈ 500KB 数据，覆盖极限场景（整页 CJK 字符）。
 constexpr uint32_t kMaxTextBlobGlyphs = 50000;
+
+/// @brief drawGlyphRunList 最大 run 数量: 256。
+///
+/// 安全理由: 防止伪造 glyphRunList.size() 导致过多 run 迭代。
+/// 典型网页文本渲染通常 < 10 runs，256 足够覆盖复杂排版。
+constexpr uint32_t kMaxGlyphRuns = 256;
 
 /// @brief drawVertices 最大顶点数: 100,000。
 ///
@@ -145,6 +158,22 @@ constexpr uint32_t kMaxVerticesCount = 100000;
 ///
 /// 安全理由: 防止 drawAtlas payload 中伪造 count 导致 OOM。
 constexpr uint32_t kMaxAtlasCount = 100000;
+
+/// @brief drawImageLattice 最大分区数: 10,000。
+///
+/// 安全理由: 防止伪造 fXCount/fYCount 导致 OOM。
+constexpr uint32_t kMaxLatticeCount = 10000;
+
+/// @brief drawEdgeAAImageSet 最大图像集大小: 10,000。
+///
+/// 安全理由: 防止伪造 count 导致 OOM。
+constexpr uint32_t kMaxImageSetCount = 10000;
+
+/// @brief 单帧最大图像槽位数量: 10,000。
+///
+/// 安全理由: 防止单帧内 image_slots_ 无界增长导致 OOM。
+/// 典型网页单帧图像数 < 100，10,000 足够覆盖复杂场景。
+constexpr uint32_t kMaxImageSlotsPerFrame = 10000;
 
 // ═══════════════════════════════════════════════════════════════
 // 图像/字体缓存上限 — §4.1.4 配置项 1 (hash-ref 模式)

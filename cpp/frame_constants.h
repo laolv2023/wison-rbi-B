@@ -188,6 +188,7 @@ enum class Opcode : uint8_t {
     kFontData      = 0x70,  ///< 字体内联数据（§8.4: SFNT/WOFF2 Magic 白名单校验）
     kImageData     = 0x71,  ///< 图像内联数据引用（关联 ImageSlot）
     kSetMatrix     = 0x72,  ///< 显式矩阵设置（非增量 concat）
+    kDrawScrollbar = 0x73,  ///< 滚动条绘制（rect + vertical + position + thumb_size）
 
     // ── 特殊 ──
     kNoop          = 0x7F,  ///< 空操作占位（SkDrawable 等不可序列化对象的降级）

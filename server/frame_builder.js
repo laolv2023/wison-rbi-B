@@ -41,6 +41,7 @@ const {
     CRC32_POLYNOMIAL,
     FLAG_IS_KEYFRAME,
     FLAG_HAS_FONT_DATA,
+    FLAG_HAS_DIRTY_RECTS,
 } = require('./config');
 
 // ═══════════════════════════════════════════════════════════════
@@ -261,18 +262,18 @@ function deserializeFrameHeader(buf) {
  * @throws {Error} 若总大小超过 MAX_BYTES_PER_FRAME
  */
 function assembleFrame(meta, commandStream) {
-    const { FLAG_HAS_DIRTY_RECTS: DIRTY_FLAG } = require('./config');
+    // FLAG_HAS_DIRTY_RECTS 已在文件顶部导入
 
     // 处理脏区域 (Phase 4 R-tree 增量帧)
     let dirtyRectsBuf = null;
+    let effectiveFlags = meta.flags || 0;  // 不修改传入的 meta 对象
     if (meta.dirtyRects && meta.dirtyRects.length > 0) {
         dirtyRectsBuf = serializeDirtyRects(meta.dirtyRects);
-        // 自动设置标志位
-        if (!meta.flags) meta.flags = 0;
-        meta.flags |= DIRTY_FLAG;
+        effectiveFlags |= FLAG_HAS_DIRTY_RECTS;
     }
 
-    const header = serializeFrameHeader(meta);
+    // 使用 effectiveFlags 而非 meta.flags，避免副作用
+    const header = serializeFrameHeader({ ...meta, flags: effectiveFlags });
 
     const cmdLen = commandStream ? commandStream.length : 0;
     const dirtyLen = dirtyRectsBuf ? dirtyRectsBuf.length : 0;

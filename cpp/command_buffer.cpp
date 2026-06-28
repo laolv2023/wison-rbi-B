@@ -149,6 +149,11 @@ CommandBuffer& CommandBuffer::operator=(CommandBuffer&& other) noexcept {
 ///
 /// @param additional_bytes 即将写入的字节数
 void CommandBuffer::ensureCapacity(size_t additional_bytes) {
+    // 防御: 整数溢出检查 — buffer_.size() + additional_bytes 可能溢出 size_t
+    if (additional_bytes > kMaxBytesPerFrame ||
+        buffer_.size() > kMaxBytesPerFrame - additional_bytes) {
+        throw std::length_error("CommandBuffer: requested size exceeds kMaxBytesPerFrame");
+    }
     if (buffer_.size() + additional_bytes > buffer_.capacity()) {
         growBuffer(buffer_.size() + additional_bytes);
     }
@@ -378,8 +383,7 @@ void CommandBuffer::writeF32(float value) {
 void CommandBuffer::writeF64(double value) {
     uint64_t bits;
     std::memcpy(&bits, &value, sizeof(bits));
-    ensureCapacity(8);
-    writeU64(bits);
+    writeU64(bits);  // writeU64 内部已调用 ensureCapacity(8)
 }
 
 /// @brief 写入布尔值 (1 字节: 0=false, 1=true)。
@@ -416,6 +420,10 @@ void CommandBuffer::writeBlob(const void* data, size_t len) {
 ///
 /// @param str UTF-8 字符串
 void CommandBuffer::writeString(const std::string& str) {
+    // Bounds check: string length must fit in uint32_t and not exceed frame payload limit
+    if (str.size() > kMaxBytesPerFrame) {
+        throw std::length_error("writeString: string exceeds frame payload limit");
+    }
     writeU32(static_cast<uint32_t>(str.size()));
     writeBlob(reinterpret_cast<const uint8_t*>(str.data()), str.size());
 }
@@ -461,15 +469,15 @@ void CommandBuffer::padToAlignment(size_t alignment) {
 ///
 /// Style encoding: 0=Fill, 1=Stroke, 2=Hair (stroke + strokeWidth==0)
 void CommandBuffer::writePaint(const SkPaint& paint) {
-    // ── Fixed fields ──────────────────────────────────────────────
+    // ── Fixed fields (与客户端 readPaint 格式一致) ──────────────
 
-    // Color (16B: r,g,b,a as f32)
-    writeColor4f(paint.getColor4f());
+    // Color (4B: RGBA u32 LE) — 客户端在 offset+0 读取 getUint32
+    writeU32(static_cast<uint32_t>(paint.getColor()));
 
-    // BlendMode (u8)
-    writeU8(static_cast<uint8_t>(paint.getBlendMode_or(SkBlendMode::kSrcOver)));
+    // StrokeWidth (4B: f32) — 客户端在 offset+4 读取 getFloat32
+    writeF32(paint.getStrokeWidth());
 
-    // Style (u8): 0=Fill, 1=Stroke, 2=Hair
+    // Style (1B) — 客户端在 offset+8 读取 getUint8
     {
         uint8_t style;
         switch (paint.getStyle()) {
@@ -477,63 +485,72 @@ void CommandBuffer::writePaint(const SkPaint& paint) {
                 style = 0;  // Fill
                 break;
             case SkPaint::kStroke_Style:
-                // Hair: stroke width == 0 with stroke style
                 style = (paint.getStrokeWidth() == 0.0f) ? 2 : 1;
                 break;
             case SkPaint::kStrokeAndFill_Style:
-                style = 1;  // Treat StrokeAndFill as Stroke (MVP simplification)
+                style = 1;
                 break;
             default:
-                style = 0;  // Fallback
+                style = 0;
                 break;
         }
         writeU8(style);
     }
 
-    writeF32(paint.getStrokeWidth());
-    writeF32(paint.getStrokeMiter());
+    // Cap (1B) — 客户端在 offset+9 读取 getUint8
     writeU8(static_cast<uint8_t>(paint.getStrokeCap()));
+
+    // Join (1B) — 客户端在 offset+10 读取 getUint8
     writeU8(static_cast<uint8_t>(paint.getStrokeJoin()));
+
+    // _pad (1B) — 对齐填充，客户端在 offset+11 跳过
+    writeU8(0);
+
+    // MiterLimit (4B: f32) — 客户端在 offset+12 读取 getFloat32
+    writeF32(paint.getStrokeMiter());
+
+    // BlendMode (1B) — 客户端在 offset+16 读取 getUint8
+    writeU8(static_cast<uint8_t>(paint.getBlendMode_or(SkBlendMode::kSrcOver)));
+
+    // AntiAlias (1B) — 客户端在 offset+17 读取 getUint8
     writeU8(paint.isAntiAlias() ? 1 : 0);
 
     // ── Shader ────────────────────────────────────────────────────
-    // v4 MVP: only linear gradient (≤2 stops). All other shaders → skip.
+    // 客户端在 offset+18 读取 hasShader (1B)
     {
         sk_sp<SkShader> shader = paint.refShader();
         if (shader) {
-            // Try to extract gradient info using asAGradient
             SkColor      colors[16];
             SkScalar     offsets[16];
             SkShader::GradientInfo gradInfo;
             gradInfo.fColors        = colors;
             gradInfo.fColorOffsets  = offsets;
-            gradInfo.fColorCount    = 16;   // Up to 16 stops (MVP uses ≤2)
+            gradInfo.fColorCount    = 16;
             int actualStops = shader->asAGradient(&gradInfo);
 
             if (actualStops > 0 && actualStops <= 16) {
-                // Linear gradient: type=0
-                writeU8(1);  // hasShader
-                writeU8(0);  // shaderType = LINEAR
+                writeU8(1);  // hasShader = true
+                writeU8(0);  // shaderType = LINEAR (客户端 SHADER_HEADER_SIZE[0])
 
-                // startPoint + endPoint (16B total)
+                // startPoint + endPoint (16B total: 4 × f32)
                 writeF32(gradInfo.fPoint[0].x());
                 writeF32(gradInfo.fPoint[0].y());
                 writeF32(gradInfo.fPoint[1].x());
                 writeF32(gradInfo.fPoint[1].y());
 
-                // tileMode (u8)
+                // tileMode (1B) + colorCount (1B) + _pad (2B) = 4B
+                // 客户端在 headerSize-4 读取 tileMode, headerSize-3 读取 colorCount
                 writeU8(static_cast<uint8_t>(gradInfo.fTileMode));
+                writeU8(static_cast<uint8_t>(actualStops));
+                writeU16(0);  // _pad (2B)
 
-                // colorStopCount (u32) + [stopPos(f32) + color(16B)]*
-                writeU32(static_cast<uint32_t>(actualStops));
+                // 颜色停止点: 每对 8B = RGBA u32 (4B) + position f32 (4B)
+                // 与客户端 readShader 和 command_validator 一致
                 for (int i = 0; i < actualStops; ++i) {
-                    writeF32(gradInfo.fColorOffsets[i]);
-                    // Convert SkColor (u32 ARGB) → SkColor4f → writeColor4f
-                    SkColor4f stopColor = SkColor4f::FromColor(gradInfo.fColors[i]);
-                    writeColor4f(stopColor);
+                    writeU32(static_cast<uint32_t>(gradInfo.fColors[i]));    // RGBA u32
+                    writeF32(gradInfo.fColorOffsets[i]);                     // position f32
                 }
             } else {
-                // Non-gradient or unsupported shader → skip (degrade to solid color)
                 writeU8(0);  // hasShader = false
             }
         } else {
@@ -541,45 +558,14 @@ void CommandBuffer::writePaint(const SkPaint& paint) {
         }
     }
 
-    // ── Effects (v4 MVP: exclude MaskFilter / ColorFilter / ImageFilter) ──
-    writeU8(0);  // hasMaskFilter  = 0 (always, MVP scope)
-    writeU8(0);  // hasColorFilter = 0 (always, MVP scope)
+    // ── MaskFilter (placeholder: 1B hasMask + 8B if present) ──
+    writeU8(0);  // hasMask = false (Phase 3 placeholder)
 
-    // PathEffect: only Dash (type=0) supported
-    {
-        sk_sp<SkPathEffect> pe = paint.refPathEffect();
-        if (pe) {
-            // First call: get interval count
-            SkPathEffect::DashInfo dashInfo;
-            pe->asADash(&dashInfo);  // Fills fCount when fIntervals==nullptr
+    // ── ColorFilter (placeholder: 1B hasColorFilter + 16B if present) ──
+    writeU8(0);  // hasColorFilter = false (Phase 3 placeholder)
 
-            if (dashInfo.fCount > 0) {
-                // Second call: get intervals and phase
-                std::vector<SkScalar> intervals(dashInfo.fCount);
-                dashInfo.fIntervals = intervals.data();
-                pe->asADash(&dashInfo);
-
-                writeU8(1);  // hasPathEffect
-                writeU8(0);  // type = DASH
-
-                writeU32(static_cast<uint32_t>(dashInfo.fCount));
-                for (int32_t i = 0; i < dashInfo.fCount; ++i) {
-                    writeF32(dashInfo.fIntervals[i]);
-                }
-                writeF32(dashInfo.fPhase);
-            } else {
-                // Not a dash effect → skip
-                writeU8(0);  // hasPathEffect = false
-            }
-        } else {
-            writeU8(0);  // hasPathEffect = false
-        }
-    }
-
-    writeU8(0);  // hasImageFilter = 0 (always, MVP scope)
-
-    // hasBlender: always 0 (use kSrcOver default)
-    writeU8(0);
+    // ── ImageFilter (placeholder: 1B hasImageFilter + 16B if present) ──
+    writeU8(0);  // hasImageFilter = false (Phase 3 placeholder)
 }
 
 void CommandBuffer::writePath(const SkPath& path) {
@@ -588,9 +574,9 @@ void CommandBuffer::writePath(const SkPath& path) {
     int verbCount = path.countVerbs();
     int pointCount = path.countPoints();
 
-    // Bounds check (§8.4 深度校验): verbCount/pointCount ≤ kMaxPathVerbs
+    // Bounds check (§8.4 深度校验): verbCount ≤ kMaxPathVerbs, pointCount ≤ kMaxPathPoints
     if (static_cast<uint32_t>(verbCount) > kMaxPathVerbs ||
-        static_cast<uint32_t>(pointCount) > kMaxPathVerbs) {
+        static_cast<uint32_t>(pointCount) > kMaxPathPoints) {
         return;  // Degrade: skip oversized path (avoid OOM)
     }
 
@@ -611,6 +597,32 @@ void CommandBuffer::writePath(const SkPath& path) {
         for (int i = 0; i < pointCount; ++i) {
             writeF32(points[i].x());
             writeF32(points[i].y());
+        }
+    }
+
+    // Write conic weights (one f32 per kConic verb)
+    // Skia stores conic weights separately from points; client readPath expects
+    // weights interleaved into the points array at conicTo positions.
+    // To match the client's readPath which reads weight as points[ptIdx+4],
+    // we must write weights as additional f32 values after the points array,
+    // one per kConic verb, in order.
+    {
+        // Count conic verbs
+        int conicCount = 0;
+        if (verbCount > 0) {
+            std::vector<uint8_t> verbs(verbCount);
+            path.getVerbs(verbs.data(), verbCount);
+            for (int i = 0; i < verbCount; ++i) {
+                if (verbs[i] == SkPath::kConic_Verb) conicCount++;
+            }
+            // Write conic weights
+            if (conicCount > 0) {
+                std::vector<SkScalar> conicWeights(conicCount);
+                path.getConicWeights(conicWeights.data(), conicCount);
+                for (int i = 0; i < conicCount; ++i) {
+                    writeF32(conicWeights[i]);
+                }
+            }
         }
     }
 }
@@ -681,12 +693,18 @@ static CommandBuffer::ImageHash ComputeImageSHA256(const SkImage* image);
 ///   - 实际编码由 Worker 线程的 encodePendingImages() 异步完成
 ///
 /// @param image Skia 图像指针（可为 nullptr，安全返回）
+// 前向声明: IsHashCryptographicallySecure 在下方定义，此处需要前向声明以供 writeImage 使用
+static bool IsHashCryptographicallySecure();
 void CommandBuffer::writeImage(const SkImage* image) {
     // 防御: 空指针安全处理
     if (!image) return;
 
-    if (image_mode_ == ImageMode::kHashRef) {
-        // hash-ref 模式: 查重 + 去重
+    // 安全检查: DJB2 回退路径不满足抗碰撞不变量，强制 inline 模式
+    const bool use_hash_ref =
+        (image_mode_ == ImageMode::kHashRef) && IsHashCryptographicallySecure();
+
+    if (use_hash_ref) {
+        // hash-ref 模式: 查重 + 去重（仅密码安全哈希可用）
         auto hash = ComputeImageSHA256(image);   // SHA-256, 32B
         if (hasImageHash(hash)) {
             // 已发送: 仅写 32B 引用（客户端从 LRU 缓存取出）
@@ -694,18 +712,15 @@ void CommandBuffer::writeImage(const SkImage* image) {
             writeBlob(hash.bytes, 32);  // 32 字节完整哈希
             return;
         }
-        // 首次遇到: 标记已发送
+        // 首次遇到: 标记已发送，然后走 inline 路径
         markImageHashSent(hash);
+        // 注意: inline 路径不写入 hash，避免客户端无法判断是否有 hash 字段
+        // hash 仅在 hash-ref 模式（flag=0x01）下使用
     }
-    // 通用路径: 内联传输
+    // inline 模式（含 hash-ref 首次遇到和 DJB2 回退路径）
     writeU8(0x00);                      // flag: 内联
     uint32_t slot = reserveImageSlot(image);  // 分配槽位 (O(1), 不编码)
     writeU32(slot);                     // 槽位 ID (命令流中引用)
-    if (image_mode_ == ImageMode::kHashRef) {
-        // hash-ref 模式附加 SHA-256，供客户端缓存索引
-        auto hash = ComputeImageSHA256(image);
-        writeBlob(hash.bytes, 32);
-    }
 }
 
 void CommandBuffer::writeSamplingOptions(const SkSamplingOptions& s) {
@@ -744,8 +759,11 @@ void CommandBuffer::writeVertices(const SkVertices* v) {
     writeU8(static_cast<uint8_t>(v->mode()));   // SkVertices::VertexMode maps directly
     writeU32(static_cast<uint32_t>(vCount));
     writeU32(static_cast<uint32_t>(iCount));
-    writeU8(v->hasTexCoords() ? 1 : 0);
-    writeU8(v->hasColors() ? 1 : 0);
+    // SkVertices API: texCoords() and colors() return nullptr if not present
+    const SkPoint* texPtr = v->texCoords();
+    const SkColor* colorPtr = v->colors();
+    writeU8(texPtr ? 1 : 0);
+    writeU8(colorPtr ? 1 : 0);
 
     // Positions: f32 × vertexCount × 2
     const SkPoint* pos = v->positions();
@@ -755,19 +773,17 @@ void CommandBuffer::writeVertices(const SkVertices* v) {
     }
 
     // TexCoords (if present): f32 × vertexCount × 2
-    if (v->hasTexCoords()) {
-        const SkPoint* tex = v->texCoords();
+    if (texPtr) {
         for (int i = 0; i < vCount; ++i) {
-            writeF32(tex[i].x());
-            writeF32(tex[i].y());
+            writeF32(texPtr[i].x());
+            writeF32(texPtr[i].y());
         }
     }
 
     // Colors (if present): u8 × vertexCount × 4 (RGBA)
-    if (v->hasColors()) {
-        const SkColor* colors = v->colors();
+    if (colorPtr) {
         for (int i = 0; i < vCount; ++i) {
-            SkColor c = colors[i];
+            SkColor c = colorPtr[i];
             writeU8(SkColorGetR(c));
             writeU8(SkColorGetG(c));
             writeU8(SkColorGetB(c));
@@ -867,6 +883,11 @@ void CommandBuffer::writeM44(const SkM44& m) {
 /// @param image Skia 图像指针（调用方持有 sk_sp，此处再增加一个引用）
 /// @returns 槽位 ID（在命令流中通过 writeU32 写入）
 uint32_t CommandBuffer::reserveImageSlot(const SkImage* image) {
+    // 防御: 单帧图像槽位数量限制，防止 OOM
+    if (image_slots_.size() >= kMaxImageSlotsPerFrame) {
+        // 淘汰最旧的槽位（FIFO），复用其 slot_id
+        image_slots_.erase(image_slots_.begin());
+    }
     uint32_t slot_id = static_cast<uint32_t>(image_slots_.size());
     ImageSlot slot;
     slot.id = slot_id;
@@ -906,6 +927,67 @@ void CommandBuffer::encodePendingImages() {
             slot.data.assign(src, src + encoded->size());
         }
         slot.encoded = true;
+    }
+}
+
+/// @brief 将已编码的图像槽位作为 kImageData 命令追加到命令流。
+///
+/// 每个 slot 生成一个 kImageData 命令:
+///   opcode(1B) + payload_len(3B) + slot_id(4B) + data_size(4B) + data(N)
+/// 必须在 AssembleFrame 之前调用。
+void CommandBuffer::appendImageCommands() {
+    // 将图像数据作为 kImageData 命令插入到命令流开头（在所有绘制命令之前），
+    // 确保客户端在处理 DRAW_IMAGE 时 slot 数据已就绪。
+    // 实现: 先构建图像命令缓冲区，再将其插入到现有命令流之前。
+
+    std::vector<uint8_t> imageCommands;
+    for (const auto& slot : image_slots_) {
+        if (slot.encoded && !slot.data.empty()) {
+            // payload: slot_id(4B) + data_size(4B) + data(N)
+            uint32_t payloadLen = 4 + 4 + static_cast<uint32_t>(slot.data.size());
+
+            // 边界检查: payload_len 字段只有 3 字节（24位），最大 16MB
+            // 同时遵守 kMaxPayloadBytes (1MB) 命令级上限，与 endCommand 一致
+            // 超过上限的图像跳过（防止 payload_len 截断导致客户端解析错位）
+            if (payloadLen > 0xFFFFFF || payloadLen > kMaxPayloadBytes) {
+                fprintf(stderr, "[CommandBuffer] appendImageCommands: slot %u data too large "
+                        "(payloadLen=%u, limit=%u), skipping\n", slot.id, payloadLen, kMaxPayloadBytes);
+                continue;
+            }
+
+            // 写入命令头: opcode(1B) + payload_len(3B)
+            imageCommands.push_back(static_cast<uint8_t>(Opcode::kImageData));
+            imageCommands.push_back(static_cast<uint8_t>(payloadLen & 0xFF));
+            imageCommands.push_back(static_cast<uint8_t>((payloadLen >> 8) & 0xFF));
+            imageCommands.push_back(static_cast<uint8_t>((payloadLen >> 16) & 0xFF));
+
+            // 写入 payload: slot_id(4B) + data_size(4B) + data(N)
+            // slot_id (LE u32)
+            imageCommands.push_back(static_cast<uint8_t>(slot.id & 0xFF));
+            imageCommands.push_back(static_cast<uint8_t>((slot.id >> 8) & 0xFF));
+            imageCommands.push_back(static_cast<uint8_t>((slot.id >> 16) & 0xFF));
+            imageCommands.push_back(static_cast<uint8_t>((slot.id >> 24) & 0xFF));
+            // data_size (LE u32)
+            uint32_t dataSize = static_cast<uint32_t>(slot.data.size());
+            imageCommands.push_back(static_cast<uint8_t>(dataSize & 0xFF));
+            imageCommands.push_back(static_cast<uint8_t>((dataSize >> 8) & 0xFF));
+            imageCommands.push_back(static_cast<uint8_t>((dataSize >> 16) & 0xFF));
+            imageCommands.push_back(static_cast<uint8_t>((dataSize >> 24) & 0xFF));
+            // data
+            imageCommands.insert(imageCommands.end(), slot.data.begin(), slot.data.end());
+
+            // 4 字节对齐填充
+            size_t totalCmdSize = 4 + payloadLen;
+            size_t remainder = totalCmdSize % 4;
+            if (remainder != 0) {
+                imageCommands.insert(imageCommands.end(), 4 - remainder, 0);
+            }
+        }
+    }
+
+    // 将图像命令插入到命令流开头
+    if (!imageCommands.empty()) {
+        buffer_.insert(buffer_.begin(), imageCommands.begin(), imageCommands.end());
     }
 }
 
@@ -1032,6 +1114,19 @@ static CommandBuffer::ImageHash ComputeImageSHA256(const SkImage* image) {
 ///
 /// n 通常 < 1000（典型网页的去重图像数量），线性扫描足够。
 /// 若性能成为瓶颈可替换为 std::unordered_set + 自定义哈希。
+/// @brief 检查当前哈希实现是否密码安全。
+///
+/// 当且仅当编译时链接了 BoringSSL/OpenSSL 时返回 true。
+/// DJB2 回退路径不满足安全不变量 I-6（256-bit 抗碰撞），
+/// 因此在回退路径下必须强制 inline 模式，禁止 hash-ref 去重。
+static bool IsHashCryptographicallySecure() {
+#if defined(USE_BORINGSSL) || defined(USE_OPENSSL)
+    return true;
+#else
+    return false;
+#endif
+}
+
 bool CommandBuffer::hasImageHash(const ImageHash& hash) const {
     for (const auto& h : sent_hashes_) {
         if (h == hash) return true;  // memcmp 32B 比较
@@ -1149,6 +1244,8 @@ static const uint32_t kCrc32Table[256] = {
 /// @param crc  初始值（首次计算传 0，增量计算传上次结果）
 /// @returns CRC32 校验值
 uint32_t ComputeCRC32(const uint8_t* data, size_t len, uint32_t crc) {
+    // 防御: 空指针安全 (len=0 时不需要访问 data)
+    if (!data && len > 0) return 0;
     crc = crc ^ 0xFFFFFFFF;  // 标准初始化 XOR
     for (size_t i = 0; i < len; ++i) {
         // 表驱动: 索引 = (crc XOR 当前字节) 的低 8 位, 新 crc = 表值 XOR (crc >> 8)

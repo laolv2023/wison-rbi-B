@@ -333,9 +333,10 @@ class CommandValidator {
                     return this._subReject(`drawPath: pointCount ${pointCount} > ${this.LIMITS.MAX_PATH_VERBS}`);
                 }
                 // verbs: 1 byte each; points: 2×f32 each = 8 bytes
+                // conicWeights: 1×f32 per kConic verb (最多 verbCount 个)
                 const minSize = 8 + verbCount + pointCount * 8;
-                // 保守上界: 最坏情况每 verb 消耗 3 个 point (cubicTo)，防 verb 类型伪造越界读
-                const worstCaseSize = 8 + verbCount + verbCount * 3 * 8;
+                // 保守上界: 最坏情况每 verb 消耗 3 个 point (cubicTo) + 每 verb 可能是 conic (4B weight)
+                const worstCaseSize = 8 + verbCount + verbCount * 3 * 8 + verbCount * 4;
                 if (minSize > payLen || worstCaseSize > payLen) {
                     return this._subReject(`drawPath: sub-structure overflow (need ≤${Math.max(minSize, worstCaseSize)}, have ${payLen})`);
                 }
@@ -382,18 +383,58 @@ class CommandValidator {
                 break;
             }
 
-            // ── drawTextBlob (0x50): tx(4)+ty(4)+glyphCount(4)+glyphs(glyphCount×2)+positions(glyphCount×2×f32) ──
-            // 威胁: glyphCount 炸弹 → 字形数量和位置数组溢出
+            // ── drawTextBlob (0x50): x(4)+y(4)+runCount(4)+[fontId(4)+glyphCount(4)+glyphs(N×2)+positions(N×8)]*runCount+paint ──
+            // 威胁: runCount/glyphCount 炸弹 → 超大量字形数据
+            // 防御: runCount ≤ 256, 每run glyphCount ≤ MAX_TEXT_BLOB_GLYPHS, 总和 ≤ MAX_TEXT_BLOB_GLYPHS
             case OP.DRAW_TEXT_BLOB: {
                 if (payLen < 12) return this._subReject('drawTextBlob: payload too short');
-                const glyphCount = payload.getUint32(8, true);  // glyphCount 在 offset 8 (tx, ty 各 4B)
-                if (glyphCount > this.LIMITS.MAX_TEXT_BLOB_GLYPHS) {
-                    return this._subReject(`drawTextBlob: glyphCount ${glyphCount} > ${this.LIMITS.MAX_TEXT_BLOB_GLYPHS}`);
+                const runCount = payload.getUint32(8, true);  // runCount 在 offset 8 (x, y 各 4B)
+                if (runCount === 0 || runCount > 256) {
+                    return this._subReject(`drawTextBlob: invalid runCount ${runCount}`);
                 }
-                // 12 header + glyphCount * 2 (glyph IDs, uint16) + glyphCount * 8 (positions, 2×f32)
-                const minSize = 12 + glyphCount * 10;
-                if (minSize > payLen) {
-                    return this._subReject(`drawTextBlob: sub-structure overflow (need ${minSize}, have ${payLen})`);
+                let off = 12;
+                let totalGlyphs = 0;
+                for (let r = 0; r < runCount; r++) {
+                    if (off + 8 > payLen) return this._subReject(`drawTextBlob: run ${r} header overflow`);
+                    const glyphCount = payload.getUint32(off + 4, true);  // fontId(4) + glyphCount(4)
+                    if (glyphCount > this.LIMITS.MAX_TEXT_BLOB_GLYPHS) {
+                        return this._subReject(`drawTextBlob: run ${r} glyphCount ${glyphCount} > ${this.LIMITS.MAX_TEXT_BLOB_GLYPHS}`);
+                    }
+                    totalGlyphs += glyphCount;
+                    if (totalGlyphs > this.LIMITS.MAX_TEXT_BLOB_GLYPHS) {
+                        return this._subReject(`drawTextBlob: total glyphs ${totalGlyphs} > ${this.LIMITS.MAX_TEXT_BLOB_GLYPHS}`);
+                    }
+                    // fontId(4) + glyphCount(4) + glyphs(N×2) + positions(N×8)
+                    off += 8 + glyphCount * 2 + glyphCount * 8;
+                    if (off > payLen) return this._subReject(`drawTextBlob: run ${r} data overflow (need ${off}, have ${payLen})`);
+                }
+                // off 现在指向 paint 起始位置，paint 至少需要 18B
+                if (off + 18 > payLen) return this._subReject(`drawTextBlob: paint too short at offset ${off}`);
+                break;
+            }
+
+            // ── drawGlyphRunList (0x51): runCount(4)+[fontId(4)+glyphCount(4)+glyphs(N×2)+positions(N×8)]*runCount ──
+            // 注意: 此 opcode 不含 x/y 和 paint
+            case OP.DRAW_GLYPH_RUN_LIST: {
+                if (payLen < 4) return this._subReject('drawGlyphRunList: payload too short');
+                const grlRunCount = payload.getUint32(0, true);
+                if (grlRunCount === 0 || grlRunCount > 256) {
+                    return this._subReject(`drawGlyphRunList: invalid runCount ${grlRunCount}`);
+                }
+                let grlOff = 4;
+                let grlTotalGlyphs = 0;
+                for (let r = 0; r < grlRunCount; r++) {
+                    if (grlOff + 8 > payLen) return this._subReject(`drawGlyphRunList: run ${r} header overflow`);
+                    const grlGlyphCount = payload.getUint32(grlOff + 4, true);
+                    if (grlGlyphCount > this.LIMITS.MAX_TEXT_BLOB_GLYPHS) {
+                        return this._subReject(`drawGlyphRunList: run ${r} glyphCount ${grlGlyphCount} > ${this.LIMITS.MAX_TEXT_BLOB_GLYPHS}`);
+                    }
+                    grlTotalGlyphs += grlGlyphCount;
+                    if (grlTotalGlyphs > this.LIMITS.MAX_TEXT_BLOB_GLYPHS) {
+                        return this._subReject(`drawGlyphRunList: total glyphs ${grlTotalGlyphs} > ${this.LIMITS.MAX_TEXT_BLOB_GLYPHS}`);
+                    }
+                    grlOff += 8 + grlGlyphCount * 2 + grlGlyphCount * 8;
+                    if (grlOff > payLen) return this._subReject(`drawGlyphRunList: run ${r} data overflow (need ${grlOff}, have ${payLen})`);
                 }
                 break;
             }
@@ -466,6 +507,45 @@ class CommandValidator {
                 break;
             }
 
+            // ── imageData (0x71): slot_id(4) + data_size(4) + data(N) + [hash(32)] ──
+            // 威胁: data_size 伪造 → 读取越界或 OOM
+            // 防御: data_size ≤ 10MB 且 8+data_size ≤ payLen
+            case OP.IMAGE_DATA: {
+                if (payLen < 8) return this._subReject('imageData: payload too short');
+                const imgDataSize = payload.getUint32(4, true);
+                if (imgDataSize > 10 * 1024 * 1024) {
+                    return this._subReject(`imageData: data size ${imgDataSize} > 10MB limit`);
+                }
+                if (8 + imgDataSize > payLen) {
+                    return this._subReject(`imageData: sub-structure overflow (need ${8 + imgDataSize}, have ${payLen})`);
+                }
+                break;
+            }
+
+            // ── setMatrix (0x72): 9 × f32 = 36B (3×3 矩阵) ──
+            // 威胁: 负载过短 → 客户端读取越界
+            // 防御: payLen ≥ 36
+            case OP.SET_MATRIX: {
+                if (payLen < 36) return this._subReject(`setMatrix: payload too short (need 36, have ${payLen})`);
+                break;
+            }
+
+            // ── drawScrollbar (0x73): rect(16B) + vertical(1B) + position(f32) + thumb_size(f32) = 25B ──
+            // 威胁: 负载过短 → 客户端读取越界
+            // 防御: payLen ≥ 25，且 position/thumb_size 在 [0, 1] 范围内
+            case OP.DRAW_SCROLLBAR: {
+                if (payLen < 25) return this._subReject(`drawScrollbar: payload too short (need 25, have ${payLen})`);
+                const sbPosition = payload.getFloat32(17, true);
+                const sbThumbSize = payload.getFloat32(21, true);
+                if (!Number.isFinite(sbPosition) || sbPosition < 0 || sbPosition > 1) {
+                    return this._subReject(`drawScrollbar: invalid position ${sbPosition}`);
+                }
+                if (!Number.isFinite(sbThumbSize) || sbThumbSize < 0 || sbThumbSize > 1) {
+                    return this._subReject(`drawScrollbar: invalid thumb_size ${sbThumbSize}`);
+                }
+                break;
+            }
+
             // ── 含 Paint 的绘制命令: 校验 Paint 内的 Shader 子结构 (Phase 2) ──
             // 威胁: Shader 中的 colorCount 字段可能伪造 → OOM
             // 防御: 递归调用 _validatePaintShader 检查 Shader 子结构的完整性
@@ -494,8 +574,8 @@ class CommandValidator {
                 } else if (opcode === OP.DRAW_ARC) {
                     paintOffset = 25;       // rect(16B) + startAngle(4B) + sweepAngle(4B) + useCenter(1B) = 25B
                 }
-                if (paintOffset >= 0 && payLen >= paintOffset + 19) {
-                    // 需要至少 19 字节 — Paint 固定头 (18B) + has_shader (1B)
+                if (paintOffset >= 0 && payLen >= paintOffset + 22) {
+                    // 需要至少 22 字节 — Paint 固定头 (18B) + hasShader(1B) + hasMask(1B) + hasColorFilter(1B) + hasImageFilter(1B)
                     const shaderResult = this._validatePaintShader(
                         payload, paintOffset, payLen
                     );

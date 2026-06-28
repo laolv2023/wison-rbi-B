@@ -98,6 +98,17 @@ class InputProxy {
      * @returns {Promise<void>}
      */
     async updateViewport(width, height, dpr = 1.0) {
+        // 输入验证: 防止恶意客户端发送非法视口尺寸
+        if (!Number.isFinite(width) || !Number.isFinite(height) || !Number.isFinite(dpr)) {
+            console.warn(`[io_proxy] Invalid viewport: w=${width} h=${height} dpr=${dpr}`);
+            return;
+        }
+        // 钳制到合理范围: 1-8192 像素
+        width = Math.max(1, Math.min(8192, Math.floor(width)));
+        height = Math.max(1, Math.min(8192, Math.floor(height)));
+        // DPR 范围: 0.1 - 4.0
+        dpr = Math.max(0.1, Math.min(4.0, dpr));
+
         this._viewportW = width;
         this._viewportH = height;
         this._dpr = dpr;
@@ -274,6 +285,8 @@ class InputProxy {
      * @returns {Promise<void>}
      */
     async _handleMouseMove(event) {
+        // 输入验证: x/y 必须为有限数字
+        if (!Number.isFinite(event.x) || !Number.isFinite(event.y)) return;
         const { pageX, pageY } = this._canvasToPage(event.x, event.y, event.frameId);
         await this._sendCommand('Input.dispatchMouseEvent', {
             type: 'mouseMoved',
@@ -295,6 +308,8 @@ class InputProxy {
      * @returns {Promise<void>}
      */
     async _handleMouseDown(event) {
+        // 输入验证: x/y 必须为有限数字
+        if (!Number.isFinite(event.x) || !Number.isFinite(event.y)) return;
         const { pageX, pageY } = this._canvasToPage(event.x, event.y, event.frameId);
 
         // 双击检测（500ms 内，2px 范围内）
@@ -334,6 +349,8 @@ class InputProxy {
      * @returns {Promise<void>}
      */
     async _handleMouseUp(event) {
+        // 输入验证: x/y 必须为有限数字
+        if (!Number.isFinite(event.x) || !Number.isFinite(event.y)) return;
         const { pageX, pageY } = this._canvasToPage(event.x, event.y, event.frameId);
 
         await this._sendCommand('Input.dispatchMouseEvent', {
@@ -360,6 +377,8 @@ class InputProxy {
      * @returns {Promise<void>}
      */
     async _handleWheel(event) {
+        // 输入验证: x/y 必须为有限数字
+        if (!Number.isFinite(event.x) || !Number.isFinite(event.y)) return;
         const { pageX, pageY } = this._canvasToPage(event.x, event.y, event.frameId);
 
         // CDP Input.dispatchMouseEvent 的 mouseWheel 类型
@@ -367,8 +386,8 @@ class InputProxy {
             type: 'mouseWheel',
             x: Math.round(pageX),
             y: Math.round(pageY),
-            deltaX: event.deltaX || 0,
-            deltaY: event.deltaY || 0,
+            deltaX: Number.isFinite(event.deltaX) ? event.deltaX : 0,
+            deltaY: Number.isFinite(event.deltaY) ? event.deltaY : 0,
             modifiers: this._modifiers,
         });
     }
