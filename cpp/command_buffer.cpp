@@ -885,10 +885,11 @@ void CommandBuffer::writeM44(const SkM44& m) {
 uint32_t CommandBuffer::reserveImageSlot(const SkImage* image) {
     // 防御: 单帧图像槽位数量限制，防止 OOM
     if (image_slots_.size() >= kMaxImageSlotsPerFrame) {
-        // 淘汰最旧的槽位（FIFO），复用其 slot_id
+        // 淘汰最旧的槽位（FIFO），但 slot_id 不复用（使用单调递增计数器）
         image_slots_.erase(image_slots_.begin());
     }
-    uint32_t slot_id = static_cast<uint32_t>(image_slots_.size());
+    // 使用单调递增计数器分配 slot_id，避免 FIFO 淘汰后 slot_id 碰撞
+    uint32_t slot_id = next_slot_id_++;
     ImageSlot slot;
     slot.id = slot_id;
     slot.image = sk_sp<const SkImage>(image);  // 构造 sk_sp，递增引用计数（线程安全）
@@ -1016,6 +1017,7 @@ void CommandBuffer::clear() {
     buffer_.clear();
     buffer_.reserve(65536);  // 预分配避免下帧立即几何增长
     image_slots_.clear();
+    next_slot_id_ = 0;  // 重置槽位 ID 计数器
     in_command_ = false;
     current_command_start_ = 0;
 }

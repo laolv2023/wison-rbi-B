@@ -396,29 +396,41 @@ class ChromiumInstance {
         }
 
         // 终止进程 — 两阶段: SIGTERM → 5s → SIGKILL
-        if (this._process && !this._process.killed) {
-            try {
-                // 先 SIGTERM（优雅关闭）— 给 Chromium 清理资源的时间
-                this._process.kill('SIGTERM');
+        if (this._process) {
+            // 检查进程是否已退出（exitCode !== null 表示已退出）
+            if (this._process.exitCode !== null || this._process.signalCode !== null) {
+                // 进程已退出，无需终止
+                this._process = null;
+            } else {
+                try {
+                    // 先 SIGTERM（优雅关闭）— 给 Chromium 清理资源的时间
+                    this._process.kill('SIGTERM');
 
-                // 5 秒后强制 SIGKILL — 防止进程卡死
-                const forceKillTimeout = setTimeout(() => {
-                    if (this._process && !this._process.killed) {
-                        this._process.kill('SIGKILL');
-                    }
-                }, 5000);
+                    // 5 秒后强制 SIGKILL — 防止进程卡死
+                    const forceKillTimeout = setTimeout(() => {
+                        if (this._process && this._process.exitCode === null) {
+                            try { this._process.kill('SIGKILL'); } catch (e) { /* 忽略 */ }
+                        }
+                    }, 5000);
 
-                // 等待进程自然退出
-                await new Promise(resolve => {
-                    this._process.once('exit', () => {
-                        clearTimeout(forceKillTimeout);
-                        resolve();
+                    // 等待进程自然退出
+                    await new Promise(resolve => {
+                        // 先检查是否已退出（避免竞态：exit 事件可能在注册监听器前已触发）
+                        if (this._process.exitCode !== null || this._process.signalCode !== null) {
+                            clearTimeout(forceKillTimeout);
+                            resolve();
+                            return;
+                        }
+                        this._process.once('exit', () => {
+                            clearTimeout(forceKillTimeout);
+                            resolve();
+                        });
                     });
-                });
-            } catch (e) {
-                // 忽略终止错误
+                } catch (e) {
+                    // 忽略终止错误（如 ESRCH: 进程不存在）
+                }
+                this._process = null;
             }
-            this._process = null;
         }
 
         this._started = false;
@@ -465,13 +477,18 @@ class ChromiumPool {
      */
     async acquire(instanceId) {
         // 如果有空闲实例，复用
-        if (this._freeInstances.length > 0) {
+        while (this._freeInstances.length > 0) {
             const id = this._freeInstances.pop();
             const instance = this._instances.get(id);
             if (instance && instance.isHealthy()) {
                 this._instances.delete(id);
                 this._instances.set(instanceId, instance);
                 return instance;
+            }
+            // 实例不健康或不存在：关闭并删除，避免资源泄漏
+            if (instance) {
+                try { await instance.close(); } catch (e) { /* 忽略关闭错误 */ }
+                this._instances.delete(id);
             }
         }
 
@@ -487,6 +504,10 @@ class ChromiumPool {
             }
         }
 
+        // 端口范围检查：防止 _nextPort 溢出 65535
+        if (this._nextPort > 65535) {
+            this._nextPort = this._portBase;
+        }
         const port = this._nextPort++;
         const instance = new ChromiumInstance({
             ...this._options,

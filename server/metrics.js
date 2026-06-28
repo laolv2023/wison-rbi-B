@@ -273,6 +273,9 @@ const SECURITY_CRC_FAILS    = 'wison_security_crc_fails';    // Counter: CRC 校
 const SECURITY_OPCODE_REJECTS = 'wison_security_opcode_rejects'; // Counter: OpCode 白名单拒绝
 const SECURITY_ZIPBOMB      = 'wison_security_zipbomb_blocked'; // Counter: 压缩炸弹拦截
 
+// ── 进程稳定性指标 ──
+const UNHANDLED_REJECTIONS = 'wison_unhandled_rejections'; // Counter: 未捕获的 Promise rejection
+
 // ═══════════════════════════════════════════════════════════════
 // 告警规则 (§8 / §10)
 //
@@ -389,4 +392,5 @@ module.exports = {
     SECURITY_CRC_FAILS,
     SECURITY_OPCODE_REJECTS,
     SECURITY_ZIPBOMB,
+    UNHANDLED_REJECTIONS,
 };

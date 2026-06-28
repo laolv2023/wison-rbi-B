@@ -94,6 +94,18 @@ export function computeCRC32(data, seed = 0) {
 // ═══════════════════════════════════════════════════════════════
 
 /**
+ * 自定义错误类：解压大小超限。
+ * 使用 code 属性而非字符串匹配，避免脆弱的消息文本依赖。
+ */
+export class DecompressionSizeError extends Error {
+    constructor(message) {
+        super(message);
+        this.name = 'DecompressionSizeError';
+        this.code = 'DECOMPRESSION_SIZE_EXCEEDED';
+    }
+}
+
+/**
  * 安全解压 gzip 数据，三层纵深防御。
  *
  * 为什么用 DecompressionStream 而非 pako 等 JS 库:
@@ -103,6 +115,7 @@ export function computeCRC32(data, seed = 0) {
  *
  * @param {ArrayBuffer} compressed - gzip 压缩的帧数据
  * @returns {Promise<ArrayBuffer>} 解压后的帧数据 (Header + Commands + Trailer)
+ * @throws {DecompressionSizeError} 解压后数据超过 MAX_BYTES_PER_FRAME
  * @throws {Error} 安全校验失败时抛出，调用方应丢弃该帧并记录告警
  */
 export async function decompressWithProtection(compressed) {
@@ -148,7 +161,7 @@ export async function decompressWithProtection(compressed) {
             // cancel() 会向底层流发送终止信号，释放已分配资源
             if (totalSize > MAX_BYTES_PER_FRAME) {
                 await reader.cancel();
-                throw new Error(
+                throw new DecompressionSizeError(
                     `Decompressed frame exceeds MAX_BYTES_PER_FRAME (${MAX_BYTES_PER_FRAME})`
                 );
             }
@@ -164,8 +177,8 @@ export async function decompressWithProtection(compressed) {
             offset += chunk.byteLength;
         }
     } catch (err) {
-        // 保留 MAX_BYTES_PER_FRAME 错误向上传播
-        if (err.message.includes('MAX_BYTES_PER_FRAME')) throw err;
+        // 保留 DecompressionSizeError 向上传播（使用 code 属性判断，不依赖消息文本）
+        if (err.code === 'DECOMPRESSION_SIZE_EXCEEDED') throw err;
         // gzip 格式错误 → 包装后抛出
         throw new Error(`gzip decompression failed: ${err.message}`);
     }

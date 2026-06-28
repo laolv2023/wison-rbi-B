@@ -793,7 +793,8 @@ void RecordingCanvas::recordTextureLayer(uint32_t /*texture_id*/,
 
 void RecordingCanvas::recordVideoLayer(uint32_t /*video_frame_id*/,
            const SkRect& /*bounds*/) {
-    // v3 排除: 视频帧通过媒体通道独[中文注释][RecordingCanvas] recordVideoLayer: video layers not supported in v3, emitting NOOP\n");
+    // v3 排除: 视频帧通过媒体通道独立传输，此处序列化为 NOOP
+    fprintf(stderr, "[RecordingCanvas] recordVideoLayer: video layers not supported in v3, emitting NOOP\n");
     safeCommand(Opcode::kNoop, [&]() {
         // no payload
     });

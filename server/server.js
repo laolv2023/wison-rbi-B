@@ -67,6 +67,7 @@ const {
     WS_CONNECTIONS,
     WS_BACKPRESSURE,
     WS_ERRORS,
+    UNHANDLED_REJECTIONS,
     checkAlerts,
 } = require('./metrics');
 const {
@@ -177,8 +178,16 @@ class WisonRBIServer {
         // ── 优雅关闭 (§8) ──
         // SIGTERM: Kubernetes/Docker 终止信号
         // SIGINT:  Ctrl+C 中断
-        process.on('SIGTERM', () => this.shutdown());
-        process.on('SIGINT', () => this.shutdown());
+        // 保存处理器引用以便在 close() 中移除，避免多实例时处理器累积
+        this._sigtermHandler = () => this.shutdown();
+        this._sigintHandler = () => this.shutdown();
+        this._unhandledRejectionHandler = (reason, promise) => {
+            console.error('[server] Unhandled Promise rejection:', reason);
+            metrics.incCounter(UNHANDLED_REJECTIONS);
+        };
+        process.on('SIGTERM', this._sigtermHandler);
+        process.on('SIGINT', this._sigintHandler);
+        process.on('unhandledRejection', this._unhandledRejectionHandler);
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -262,6 +271,20 @@ class WisonRBIServer {
         this._isShuttingDown = true;
         console.log('[server] Shutting down...');
 
+        // 移除进程级事件处理器（避免多实例时累积）
+        if (this._sigtermHandler) {
+            process.removeListener('SIGTERM', this._sigtermHandler);
+            this._sigtermHandler = null;
+        }
+        if (this._sigintHandler) {
+            process.removeListener('SIGINT', this._sigintHandler);
+            this._sigintHandler = null;
+        }
+        if (this._unhandledRejectionHandler) {
+            process.removeListener('unhandledRejection', this._unhandledRejectionHandler);
+            this._unhandledRejectionHandler = null;
+        }
+
         // 关闭所有 WebSocket 连接
         for (const [id, session] of this._sessions) {
             session.close();
@@ -278,9 +301,13 @@ class WisonRBIServer {
             console.error('[server] Chromium shutdown error:', err.message);
         }
 
-        // 关闭 HTTP Server
+        // 关闭 WebSocket Server 和 HTTP Server（等待现有连接关闭）
         this._wsServer.close();
-        this._httpServer.close();
+        await new Promise((resolve) => {
+            this._httpServer.close(() => resolve());
+            // 5 秒超时保护：防止某些连接永不关闭
+            setTimeout(resolve, 5000);
+        });
 
         console.log('[server] Shutdown complete');
         process.exit(0);
@@ -353,8 +380,18 @@ class WisonRBIServer {
             console.error(`[server] Failed to initialize session ${sessionId}:`, err.message);
             // 发送结构化错误消息给客户端
             this._sendError(ws, 'SESSION_INIT_FAILED', err.message);
+            // 释放可能已获取的 Chromium 实例（避免资源泄漏）
+            if (session.chromium) {
+                try {
+                    this._chromiumPool.release(sessionId);
+                } catch (releaseErr) {
+                    console.error(`[server] Failed to release chromium for ${sessionId}:`, releaseErr.message);
+                }
+            }
             session.close();
             this._sessions.delete(sessionId);
+            // 更新活跃会话数指标（与正常清理路径保持一致）
+            metrics.setGauge(SESSIONS_ACTIVE, this._sessions.size);
             return;
         }
 
@@ -539,10 +576,10 @@ class WisonRBIServer {
             try {
                 const parsed = new URL(url);
                 const hostname = parsed.hostname.toLowerCase();
-                // 防御十进制/十六进制 IP 绕过: 尝试解析为数字 IP
-                // 例如: 2130706433 → 127.0.0.1, 0x7f000001 → 127.0.0.1
+                // 防御十进制/十六进制/八进制 IP 绕过: 尝试解析为数字 IP
+                // 例如: 2130706433 → 127.0.0.1, 0x7f000001 → 127.0.0.1, 0177.0.0.1 → 127.0.0.1
                 let resolvedHostname = hostname;
-                // 如果是纯数字，尝试转换为 IP
+                // 如果是纯数字，尝试转换为 IP（十进制）
                 if (/^\d+$/.test(hostname)) {
                     const num = parseInt(hostname, 10);
                     if (num >= 0 && num <= 0xFFFFFFFF) {
@@ -562,6 +599,20 @@ class WisonRBIServer {
                         const c = (num >>> 8) & 0xFF;
                         const d = num & 0xFF;
                         resolvedHostname = `${a}.${b}.${c}.${d}`;
+                    }
+                }
+                // 如果是八进制 IP（以 0 开头且包含点，如 0177.0.0.1）
+                // 每段以 0 开头的数字会被解析为八进制
+                if (/^0\d*\./.test(hostname)) {
+                    const parts = hostname.split('.');
+                    const decimalParts = parts.map(p => {
+                        if (/^0\d+$/.test(p)) {
+                            return parseInt(p, 8);  // 八进制转十进制
+                        }
+                        return parseInt(p, 10);
+                    });
+                    if (decimalParts.every(p => p >= 0 && p <= 255) && decimalParts.length === 4) {
+                        resolvedHostname = decimalParts.join('.');
                     }
                 }
                 const blockedPatterns = [
@@ -631,6 +682,18 @@ class WisonRBIServer {
 
         // 背压检测：如果缓冲区超过高水位，丢弃非关键帧 (§4 / §8)
         if (ws.bufferedAmount > WS_HIGH_WATER_MARK) {
+            // 关键帧硬上限：如果缓冲区超过 5 倍高水位（5MB），即使关键帧也丢弃
+            // 并关闭连接，防止慢客户端导致 OOM
+            if (ws.bufferedAmount > WS_HIGH_WATER_MARK * 5) {
+                metrics.counter(FRAMES_DROPPED);
+                metrics.counter(WS_ERRORS);
+                console.error(
+                    `[server] Critical backpressure: closing session ${session.id} ` +
+                    `(${ws.bufferedAmount} bytes buffered, limit ${WS_HIGH_WATER_MARK * 5})`
+                );
+                ws.close(1011, 'Backpressure overload');
+                return;
+            }
             if (!frameMeta.isKeyframe) {
                 // 丢弃非关键帧 — 关键帧必须发送以保证客户端状态同步
                 metrics.counter(FRAMES_DROPPED);

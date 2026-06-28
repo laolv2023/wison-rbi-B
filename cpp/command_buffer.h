@@ -479,9 +479,15 @@ private:
 
     /// @brief 图像延迟编码槽位列表。
     ///
-    /// 索引即为槽位 ID。Compositor 线程写入 sk_sp 引用，
+    /// Compositor 线程写入 sk_sp 引用，
     /// Worker 线程写入编码数据。线程安全由 sk_sp 引用计数保证。
+    /// 槽位 ID 由 next_slot_id_ 单调递增分配，不依赖 vector 索引。
     std::vector<ImageSlot> image_slots_;
+
+    /// @brief 下一个图像槽位 ID（单调递增，不复用）。
+    ///
+    /// 避免 FIFO 淘汰时 slot_id 碰撞。uint32_t 范围足够单帧使用。
+    uint32_t next_slot_id_ = 0;
 
     /// @brief 已发送图像哈希集合（hash-ref 模式去重）。
     ///

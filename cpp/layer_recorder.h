@@ -294,17 +294,17 @@ public:
         bool is_keyframe,
         ImageMode image_mode = ImageMode::kInline);
 
+    /// @brief RecordingCanvas 工厂类型别名。
+    ///
+    /// 签名: (int width, int height, ImageMode) → unique_ptr<RecordingCanvas>
+    using CanvasFactory = std::function<std::unique_ptr<RecordingCanvas>(int, int, ImageMode)>;
+
     /// @brief 设置 RecordingCanvas 工厂（用于测试注入/模拟）。
     ///
     /// 单元测试中可注入 MockRecordingCanvas 以验证序列化输出。
     ///
     /// @param factory 返回 RecordingCanvas 实例的可调用对象
     void setCanvasFactory(CanvasFactory factory) { canvas_factory_ = std::move(factory); }
-
-    /// @brief RecordingCanvas 工厂类型别名。
-    ///
-    /// 签名: (int width, int height, ImageMode) → unique_ptr<RecordingCanvas>
-    using CanvasFactory = std::function<std::unique_ptr<RecordingCanvas>(int, int, ImageMode)>;
 
 private:
     CanvasFactory canvas_factory_;  ///< RecordingCanvas 工厂（可注入）
