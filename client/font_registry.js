@@ -172,6 +172,17 @@ class FontRegistry {
                 this._evictOne();
             }
 
+            // ── 重复 font_id: 先释放旧条目 ──
+            // 直接覆盖会导致 _currentBytes 计算错误（旧数据大小未扣除）
+            const existing = this._fonts.get(fontId);
+            if (existing) {
+                this._currentBytes -= existing.data ? existing.data.byteLength : 0;
+                // 旧 Typeface 需要显式释放以避免 WASM 内存泄漏
+                if (existing.typeface && typeof existing.typeface.delete === 'function') {
+                    try { existing.typeface.delete(); } catch (e) { /* 忽略 */ }
+                }
+            }
+
             // ── 注册到映射表 ──
             this._fonts.set(fontId, {
                 typeface,
