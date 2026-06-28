@@ -427,15 +427,19 @@ void RecordingCanvas::drawAtlas(const SkImage* atlas,
         return;
     }
     // FIX-H1: early negative count check (prevents wrap to large uint32)
+    // FIX: 与 null 检查一致，写入 NOOP 保持 SAVE/RESTORE 平衡
     if (count < 0) {
         fprintf(stderr, "[RecordingCanvas] drawAtlas: negative count=%d, emitting NOOP\n", count);
+        safeCommand(Opcode::kNoop, [&]() {});
         return;
     }
 
     // 边界检查: count ≤ kMaxAtlasCount (100,000)
+    // FIX: 与 null 检查一致，写入 NOOP 保持 SAVE/RESTORE 平衡
     if (static_cast<uint32_t>(count) > kMaxAtlasCount) {
-        fprintf(stderr, "[RecordingCanvas] drawAtlas: count=%d exceeds kMaxAtlasCount=%u\n",
+        fprintf(stderr, "[RecordingCanvas] drawAtlas: count=%d exceeds kMaxAtlasCount=%u, emitting NOOP\n",
                 count, kMaxAtlasCount);
+        safeCommand(Opcode::kNoop, [&]() {});
         return;
     }
 
@@ -747,13 +751,13 @@ void RecordingCanvas::drawVertices(const SkVertices* vertices,
         return;
     }
     // 边界检查: vertexCount ≤ kMaxVerticesCount (100,000)
-    if (vertices) {
-        int vc = vertices->vertexCount();
-        if (vc < 0 || static_cast<uint32_t>(vc) > kMaxVerticesCount) {
-            fprintf(stderr, "[RecordingCanvas] drawVertices: vertexCount=%d exceeds kMaxVerticesCount=%u\n",
-                    vc, kMaxVerticesCount);
-            return;
-        }
+    // FIX: 与 null 检查一致，超大 vertices 也写入 NOOP，保持 SAVE/RESTORE 平衡
+    int vc = vertices->vertexCount();
+    if (vc < 0 || static_cast<uint32_t>(vc) > kMaxVerticesCount) {
+        fprintf(stderr, "[RecordingCanvas] drawVertices: vertexCount=%d exceeds kMaxVerticesCount=%u, emitting NOOP\n",
+                vc, kMaxVerticesCount);
+        safeCommand(Opcode::kNoop, [&]() {});
+        return;
     }
 
     safeCommand(Opcode::kDrawVerticesObject, [&]() {
