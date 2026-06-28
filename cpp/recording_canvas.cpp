@@ -788,8 +788,16 @@ void RecordingCanvas::drawAnnotation(const SkRect& rect, const char key[],
         }
         // 写入 value blob
         if (value && value->size() > 0) {
-            buffer_.writeU32(static_cast<uint32_t>(value->size()));
-            buffer_.writeBlob(value->data(), value->size());
+            // FIX: 边界检查 — value->size() 必须能安全转换为 uint32_t
+            // 否则截断会导致长度前缀与实际数据不匹配，协议反序列化错位
+            if (value->size() > 0xFFFFFFFF) {
+                fprintf(stderr, "[RecordingCanvas] drawAnnotation: value size %zu exceeds uint32_t max\n",
+                        value->size());
+                buffer_.writeU32(0);  // 写入空 blob 占位
+            } else {
+                buffer_.writeU32(static_cast<uint32_t>(value->size()));
+                buffer_.writeBlob(value->data(), value->size());
+            }
         } else {
             buffer_.writeU32(0);
         }
