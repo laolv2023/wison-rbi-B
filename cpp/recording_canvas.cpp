@@ -536,17 +536,16 @@ void RecordingCanvas::drawEdgeAAQuad(const SkRect& rect,
                                       SkCanvas::QuadAAFlags aaFlags,
                                       const SkColor4f& color,
                                       SkBlendMode mode) {
-    // FIX-C1: null check on clip before looping 4 points
-    if (clip == nullptr) {
-        fprintf(stderr, "[RecordingCanvas] drawEdgeAAQuad: clip is null, emitting NOOP\n");
-        safeCommand(Opcode::kNoop, [&]() {});
-        return;
-    }
+    // FIX: clip 可以为 null（表示无裁剪），不应写入 NOOP
+    // Skia API 允许 clip=null，序列化时用 hasClip 标志区分
 
     safeCommand(Opcode::kDrawEdgeAAQuad, [&]() {
         buffer_.writeRect(rect);
-        for (int i = 0; i < 4; ++i) {
-            buffer_.writePoint(clip[i]);
+        buffer_.writeU8(clip != nullptr ? 1 : 0);  // hasClip 标志
+        if (clip) {
+            for (int i = 0; i < 4; ++i) {
+                buffer_.writePoint(clip[i]);
+            }
         }
         buffer_.writeU32(static_cast<uint32_t>(aaFlags));
         buffer_.writeColor4f(color);
