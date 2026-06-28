@@ -205,6 +205,15 @@ void RecordingCanvas::clipRRect(const SkRRect& rrect, SkClipOp op, bool doAA) {
 }
 
 void RecordingCanvas::clipPath(const SkPath& path, SkClipOp op, bool doAA) {
+    // FIX: 与 drawPath 一致的边界检查，防止 writePath 静默跳过导致协议错位
+    if (static_cast<uint32_t>(path.countVerbs()) > kMaxPathVerbs ||
+        static_cast<uint32_t>(path.countPoints()) > kMaxPathPoints) {
+        fprintf(stderr, "[RecordingCanvas] clipPath: verbCount=%d or pointCount=%d "
+                "exceeds limits (verbs=%u, points=%u), emitting NOOP\n",
+                path.countVerbs(), path.countPoints(), kMaxPathVerbs, kMaxPathPoints);
+        safeCommand(Opcode::kNoop, [&]() {});
+        return;
+    }
     safeCommand(Opcode::kClipPath, [&]() {
         buffer_.writePath(path);
         buffer_.writeU8(op == SkClipOp::kIntersect ? 0 : 1);

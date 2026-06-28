@@ -724,7 +724,14 @@ import {
                         }
                         paint.delete();
                     } else {
-                        skCanvas.saveLayer(null, bounds ? new CanvasKit.LTRBRect(bounds[0], bounds[1], bounds[2], bounds[3]) : null);
+                        // FIX: 修复 LTRBRect WASM 内存泄漏 — 原代码创建 LTRBRect 后未 delete
+                        if (bounds) {
+                            const r = new CanvasKit.LTRBRect(bounds[0], bounds[1], bounds[2], bounds[3]);
+                            skCanvas.saveLayer(null, r);
+                            r.delete();
+                        } else {
+                            skCanvas.saveLayer(null, null);
+                        }
                     }
                 }
                 break;
