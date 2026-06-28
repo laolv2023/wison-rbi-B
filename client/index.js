@@ -696,11 +696,20 @@ import {
                 break;
             case OP.SAVE_LAYER:
                 {
+                    // FIX: 边界检查 — payLen 至少需要 2 字节 (hasBounds + hasPaint)
+                    if (payLen < 2) {
+                        auditLog(LOG_LEVELS.WARN, 'saveLayer_payload_too_short', { payLen });
+                        break;
+                    }
                     // Protocol: bounds_presence(1B) + [bounds(16B)] + paint_presence(1B) + [paint(N)]
                     let off = 0;
                     const hasBounds = payload.getUint8(off); off += 1;
                     let bounds = null;
                     if (hasBounds) {
+                        if (off + 16 > payLen) {
+                            auditLog(LOG_LEVELS.WARN, 'saveLayer_bounds_oob', { off, payLen });
+                            break;
+                        }
                         bounds = [
                             payload.getFloat32(off, true),      // left
                             payload.getFloat32(off + 4, true),  // top
@@ -708,6 +717,10 @@ import {
                             payload.getFloat32(off + 12, true)  // bottom
                         ];
                         off += 16;
+                    }
+                    if (off >= payLen) {
+                        auditLog(LOG_LEVELS.WARN, 'saveLayer_missing_paint_flag', { off, payLen });
+                        break;
                     }
                     const hasPaint = payload.getUint8(off); off += 1;
                     let paint = null;
@@ -738,16 +751,20 @@ import {
 
             // ── 变换 ──
             case OP.TRANSLATE:
+                if (payLen < 8) { auditLog(LOG_LEVELS.WARN, 'translate_payload_too_short', { payLen }); break; }
                 skCanvas.translate(payload.getFloat32(0, true), payload.getFloat32(4, true));
                 break;
             case OP.SCALE:
+                if (payLen < 8) { auditLog(LOG_LEVELS.WARN, 'scale_payload_too_short', { payLen }); break; }
                 skCanvas.scale(payload.getFloat32(0, true), payload.getFloat32(4, true));
                 break;
             case OP.ROTATE:
+                if (payLen < 4) { auditLog(LOG_LEVELS.WARN, 'rotate_payload_too_short', { payLen }); break; }
                 skCanvas.rotate(payload.getFloat32(0, true), 0, 0);
                 break;
             case OP.CONCAT:
                 // 9-float 矩阵
+                if (payLen < 36) { auditLog(LOG_LEVELS.WARN, 'concat_payload_too_short', { payLen }); break; }
                 {
                     const m = new Float32Array(9);
                     for (let i = 0; i < 9; i++) m[i] = payload.getFloat32(i * 4, true);
@@ -756,6 +773,7 @@ import {
                 break;
             case OP.CONCAT44:
                 // 16-float 矩阵 (4×4)
+                if (payLen < 64) { auditLog(LOG_LEVELS.WARN, 'concat44_payload_too_short', { payLen }); break; }
                 {
                     const m = new Float32Array(16);
                     for (let i = 0; i < 16; i++) m[i] = payload.getFloat32(i * 4, true);
@@ -766,6 +784,7 @@ import {
             // ── 裁剪 ──
             case OP.CLIP_RECT:
                 {
+                    if (payLen < 18) { auditLog(LOG_LEVELS.WARN, 'clipRect_payload_too_short', { payLen }); break; }
                     const rect = readRect(payload, 0);
                     const op = payload.getUint8(16);
                     const doAA = payload.getUint8(17);
@@ -774,6 +793,7 @@ import {
                 break;
             case OP.CLIP_RRECT:
                 {
+                    if (payLen < 51) { auditLog(LOG_LEVELS.WARN, 'clipRRect_payload_too_short', { payLen }); break; }
                     const rrect = readRRect(payload, 0);
                     const op = payload.getUint8(49);
                     const doAA = payload.getUint8(50);
@@ -797,6 +817,7 @@ import {
             // ── 形状绘制 ──
             case OP.DRAW_RECT:
                 {
+                    if (payLen < 16) { auditLog(LOG_LEVELS.WARN, 'drawRect_payload_too_short', { payLen }); break; }
                     const rect = readRect(payload, 0);
                     const paint = readPaint(payload, 16);
                     if (paint) {
@@ -807,6 +828,7 @@ import {
                 break;
             case OP.DRAW_RRECT:
                 {
+                    if (payLen < 49) { auditLog(LOG_LEVELS.WARN, 'drawRRect_payload_too_short', { payLen }); break; }
                     const rrect = readRRect(payload, 0);
                     const paint = readPaint(payload, 49);
                     if (paint) {
@@ -817,6 +839,7 @@ import {
                 break;
             case OP.DRAW_OVAL:
                 {
+                    if (payLen < 16) { auditLog(LOG_LEVELS.WARN, 'drawOval_payload_too_short', { payLen }); break; }
                     const rect = readRect(payload, 0);
                     const paint = readPaint(payload, 16);
                     if (paint) {
@@ -827,6 +850,7 @@ import {
                 break;
             case OP.DRAW_PATH:
                 {
+                    if (payLen < 8) { auditLog(LOG_LEVELS.WARN, 'drawPath_payload_too_short', { payLen }); break; }
                     const verbCount = payload.getUint32(0, true);
                     const pointCount = payload.getUint32(4, true);
                     const path = readPath(payload, 0);
@@ -860,8 +884,14 @@ import {
                 break;
             case OP.DRAW_POINTS:
                 {
+                    if (payLen < 5) { auditLog(LOG_LEVELS.WARN, 'drawPoints_payload_too_short', { payLen }); break; }
                     const mode = payload.getUint8(0);
                     const count = payload.getUint32(1, true);
+                    // 边界检查: 5 + count * 8 <= payLen
+                    if (count > 100000 || 5 + count * 8 > payLen) {
+                        auditLog(LOG_LEVELS.WARN, 'drawPoints_count_oob', { count, payLen });
+                        break;
+                    }
                     const pts = new Float32Array(count * 2);
                     for (let i = 0; i < count; i++) {
                         pts[i * 2]     = payload.getFloat32(5 + i * 8, true);
