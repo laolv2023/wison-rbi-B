@@ -625,6 +625,24 @@ void RecordingCanvas::drawTextBlob(const SkTextBlob* blob,
         return;
     }
 
+    // FIX: 与 drawGlyphRunList 一致的边界检查，防止 writeTextBlob 静默跳过导致协议错位
+    // writeTextBlob 内部有 totalGlyphs > kMaxTextBlobGlyphs 的早返回，
+    // 但此时 opcode 已写入 buffer，会导致客户端反序列化错位
+    {
+        uint32_t totalGlyphs = 0;
+        SkTextBlob::Iter iter(*blob);
+        SkTextBlob::Iter::Run run;
+        while (iter.next(&run)) {
+            totalGlyphs += static_cast<uint32_t>(run.fGlyphCount);
+        }
+        if (totalGlyphs > kMaxTextBlobGlyphs) {
+            fprintf(stderr, "[RecordingCanvas] drawTextBlob: totalGlyphs=%u exceeds limit %u, emitting NOOP\n",
+                    totalGlyphs, kMaxTextBlobGlyphs);
+            safeCommand(Opcode::kNoop, [&]() {});
+            return;
+        }
+    }
+
     // FIX-H6: TODO — font_id is always 0 (default system font).
     // A proper font registry with unique font_id assignment should be implemented.
     safeCommand(Opcode::kDrawTextBlob, [&]() {
