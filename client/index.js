@@ -943,6 +943,10 @@ import {
                 break;
             case OP.DRAW_COLOR:
                 {
+                    if (payLen < 5) {
+                        auditLog(LOG_LEVELS.WARN, 'drawColor_payload_too_short', { payLen });
+                        break;
+                    }
                     const r = payload.getUint8(0);
                     const g = payload.getUint8(1);
                     const b = payload.getUint8(2);
@@ -1529,10 +1533,14 @@ import {
             if (paint) {
                 skCanvas.drawImage(img, left, top, paint);
                 paint.delete();
+                paint = null;  // 标记已释放
             } else {
                 skCanvas.drawImage(img, left, top);
             }
             img.delete();
+        } else if (paint) {
+            // FIX: img 为 null 时 paint 未释放 — WASM 内存泄漏
+            paint.delete();
         }
     }
 
@@ -1627,17 +1635,25 @@ import {
         if (img) {
             const src = new CanvasKit.LTRBRect(srcRect[0], srcRect[1], srcRect[2], srcRect[3]);
             const dst = new CanvasKit.LTRBRect(dstRect[0], dstRect[1], dstRect[2], dstRect[3]);
-            if (paint) {
-                skCanvas.drawImageRect(img, src, dst, paint);
-                paint.delete();
-            } else {
-                const defaultPaint = new CanvasKit.Paint();
-                skCanvas.drawImageRect(img, src, dst, defaultPaint);
-                defaultPaint.delete();
+            try {
+                if (paint) {
+                    skCanvas.drawImageRect(img, src, dst, paint);
+                    paint.delete();
+                    paint = null;  // 标记已释放，避免 finally 重复删除
+                } else {
+                    const defaultPaint = new CanvasKit.Paint();
+                    skCanvas.drawImageRect(img, src, dst, defaultPaint);
+                    defaultPaint.delete();
+                }
+            } finally {
+                // FIX: 确保 src/dst/img 在异常路径下也被释放
+                src.delete();
+                dst.delete();
+                img.delete();
             }
-            src.delete();
-            dst.delete();
-            img.delete();
+        } else if (paint) {
+            // FIX: img 为 null 时 paint 未释放 — WASM 内存泄漏
+            paint.delete();
         }
     }
 
