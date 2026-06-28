@@ -149,7 +149,9 @@ function serializeFrameHeader(meta) {
     offset += 1;
 
     // Byte 2-5: frame_id (uint32 LE)
-    buf.writeUInt32LE(meta.frameId, offset);
+    // 防御: NaN/Infinity/负数会导致 writeUInt32LE 抛出 RangeError
+    const frameId = Number.isFinite(meta.frameId) ? Math.max(0, Math.min(meta.frameId, 0xFFFFFFFF)) : 0;
+    buf.writeUInt32LE(frameId, offset);
     offset += 4;
 
     // Byte 6-13: timestamp_ms (int64 LE)
@@ -161,32 +163,36 @@ function serializeFrameHeader(meta) {
 
     // Byte 14-17: scroll_x (int32 LE)
     // int32 允许负数 — 页面可能向上/左滚动
-    buf.writeInt32LE(meta.scrollX, offset);
+    // 防御: NaN/Infinity 会导致 writeInt32LE 抛出 RangeError
+    const scrollX = Number.isFinite(meta.scrollX) ? Math.max(-0x80000000, Math.min(meta.scrollX, 0x7FFFFFFF)) : 0;
+    buf.writeInt32LE(scrollX, offset);
     offset += 4;
 
     // Byte 18-21: scroll_y (int32 LE)
-    buf.writeInt32LE(meta.scrollY, offset);
+    const scrollY = Number.isFinite(meta.scrollY) ? Math.max(-0x80000000, Math.min(meta.scrollY, 0x7FFFFFFF)) : 0;
+    buf.writeInt32LE(scrollY, offset);
     offset += 4;
 
     // Byte 22-23: viewport_w (uint16 LE)
     // 安全检查: 防止大于 65535 的 viewport（uint16 上限）。
     // 合法 viewport 通常 ≤ 7680 (8K)，截断为 65535 仅作为防御性兜底。
-    const vpW = Math.min(meta.viewportW, 65535);
+    // 防御: NaN/负数会导致 writeUInt16LE 抛出 RangeError
+    const vpW = Math.max(0, Math.min(meta.viewportW | 0, 65535));
     buf.writeUInt16LE(vpW, offset);
     offset += 2;
 
     // Byte 24-25: viewport_h (uint16 LE)
-    const vpH = Math.min(meta.viewportH, 65535);
+    const vpH = Math.max(0, Math.min(meta.viewportH | 0, 65535));
     buf.writeUInt16LE(vpH, offset);
     offset += 2;
 
     // Byte 26-27: canvas_w (uint16 LE)
-    const cW = Math.min(meta.canvasW, 65535);
+    const cW = Math.max(0, Math.min(meta.canvasW | 0, 65535));
     buf.writeUInt16LE(cW, offset);
     offset += 2;
 
     // Byte 28-29: canvas_h (uint16 LE)
-    const cH = Math.min(meta.canvasH, 65535);
+    const cH = Math.max(0, Math.min(meta.canvasH | 0, 65535));
     buf.writeUInt16LE(cH, offset);
     offset += 2;
 

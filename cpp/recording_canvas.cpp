@@ -659,7 +659,11 @@ void RecordingCanvas::drawGlyphRunList(const SkGlyphRunList& glyphRunList,
             buffer_.writeU32(font_id);
 
             // glyph 数量
-            uint32_t glyph_count = static_cast<uint32_t>(run.fGlyphCount);
+            // 防御: 如果 fGlyphs 或 fPositions 为空，将 glyph_count 设为 0，
+            // 避免写入非零 count 但缺少 glyph/position 数据导致协议反序列化错位
+            uint32_t glyph_count = (run.fGlyphs && run.fPositions)
+                ? static_cast<uint32_t>(run.fGlyphCount)
+                : 0;
             buffer_.writeU32(glyph_count);
 
             // glyph 索引 (uint16_t[])

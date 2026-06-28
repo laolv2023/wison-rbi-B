@@ -412,15 +412,19 @@ class InputProxy {
         // 更新修饰键状态 — 必须在发送事件前更新
         this._updateModifiers(event, true);
 
+        // 防御: event.key 可能为 null/undefined/非字符串（恶意或异常客户端）
+        const keyStr = typeof event.key === 'string' ? event.key : '';
+        const codeStr = typeof event.code === 'string' ? event.code : '';
+
         await this._sendCommand('Input.dispatchKeyEvent', {
             type: 'keyDown',
-            key: event.key,
-            code: event.code,
+            key: keyStr,
+            code: codeStr,
             location: event.location || 0,
             modifiers: this._modifiers,
             isKeypad: event.location === 3,  // location=3 = 数字键盘
             // text: 仅可打印单字符传递，用于文本输入合成
-            text: event.key.length === 1 ? event.key : undefined,
+            text: keyStr.length === 1 ? keyStr : undefined,
         });
     }
 
@@ -435,10 +439,14 @@ class InputProxy {
     async _handleKeyUp(event) {
         this._updateModifiers(event, false);
 
+        // 防御: event.key 可能为 null/undefined/非字符串
+        const keyStr = typeof event.key === 'string' ? event.key : '';
+        const codeStr = typeof event.code === 'string' ? event.code : '';
+
         await this._sendCommand('Input.dispatchKeyEvent', {
             type: 'keyUp',
-            key: event.key,
-            code: event.code,
+            key: keyStr,
+            code: codeStr,
             location: event.location || 0,
             modifiers: this._modifiers,
             isKeypad: event.location === 3,
