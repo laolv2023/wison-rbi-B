@@ -498,12 +498,10 @@ void RecordingCanvas::drawPatch(const SkPoint cubics[12],
                                  const SkPoint texCoords[4],
                                  SkBlendMode mode,
                                  const SkPaint& paint) {
-    // FIX-C1: null check on cubics, colors, texCoords before iterating
-    if (cubics == nullptr || colors == nullptr || texCoords == nullptr) {
-        fprintf(stderr, "[RecordingCanvas] drawPatch: null pointer(s) cubics=%p colors=%p "
-                "texCoords=%p, emitting NOOP\n",
-                static_cast<const void*>(cubics), static_cast<const void*>(colors),
-                static_cast<const void*>(texCoords));
+    // FIX-C1: cubics 是必需的（12 个控制点定义 patch 形状）
+    // FIX: colors 和 texCoords 可以为 null（Skia API 允许，表示无颜色/纹理）
+    if (cubics == nullptr) {
+        fprintf(stderr, "[RecordingCanvas] drawPatch: cubics is null, emitting NOOP\n");
         safeCommand(Opcode::kNoop, [&]() {});
         return;
     }
@@ -513,17 +511,23 @@ void RecordingCanvas::drawPatch(const SkPoint cubics[12],
         for (int i = 0; i < 12; ++i) {
             buffer_.writePoint(cubics[i]);
         }
-        // 4 个颜色 (SkColor → SkColor4f)
-        for (int i = 0; i < 4; ++i) {
-            SkColor c = colors[i];
-            buffer_.writeF32(SkColorGetR(c) / 255.0f);
-            buffer_.writeF32(SkColorGetG(c) / 255.0f);
-            buffer_.writeF32(SkColorGetB(c) / 255.0f);
-            buffer_.writeF32(SkColorGetA(c) / 255.0f);
+        // 4 个颜色 (SkColor → SkColor4f) — colors 可以为 null
+        buffer_.writeU8(colors != nullptr ? 1 : 0);  // hasColors 标志
+        if (colors) {
+            for (int i = 0; i < 4; ++i) {
+                SkColor c = colors[i];
+                buffer_.writeF32(SkColorGetR(c) / 255.0f);
+                buffer_.writeF32(SkColorGetG(c) / 255.0f);
+                buffer_.writeF32(SkColorGetB(c) / 255.0f);
+                buffer_.writeF32(SkColorGetA(c) / 255.0f);
+            }
         }
-        // 4 个纹理坐标
-        for (int i = 0; i < 4; ++i) {
-            buffer_.writePoint(texCoords[i]);
+        // 4 个纹理坐标 — texCoords 可以为 null
+        buffer_.writeU8(texCoords != nullptr ? 1 : 0);  // hasTexCoords 标志
+        if (texCoords) {
+            for (int i = 0; i < 4; ++i) {
+                buffer_.writePoint(texCoords[i]);
+            }
         }
 
         buffer_.writeU8(static_cast<uint8_t>(mode));
