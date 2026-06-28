@@ -1021,19 +1021,19 @@ import {
                         const thumbTop = sbRect[1] + sbPosition * thumbH;
                         const thumbBottom = Math.min(sbRect[3], thumbTop + sbThumbSize * thumbH);
                         const thumbRect = new CanvasKit.LTRBRect(sbRect[0], thumbTop, sbRect[2], thumbBottom);
-                        skCanvas.drawRRect(
-                            new CanvasKit.RRect(thumbRect, 2, 2, 2, 2),
-                            thumbPaint
-                        );
+                        const rrect = new CanvasKit.RRect(thumbRect, 2, 2, 2, 2);
+                        skCanvas.drawRRect(rrect, thumbPaint);
+                        rrect.delete();
+                        thumbRect.delete();
                     } else {
                         const thumbW = sbRect[2] - sbRect[0];
                         const thumbLeft = sbRect[0] + sbPosition * thumbW;
                         const thumbRight = Math.min(sbRect[2], thumbLeft + sbThumbSize * thumbW);
                         const thumbRect = new CanvasKit.LTRBRect(thumbLeft, sbRect[1], thumbRight, sbRect[3]);
-                        skCanvas.drawRRect(
-                            new CanvasKit.RRect(thumbRect, 2, 2, 2, 2),
-                            thumbPaint
-                        );
+                        const rrect = new CanvasKit.RRect(thumbRect, 2, 2, 2, 2);
+                        skCanvas.drawRRect(rrect, thumbPaint);
+                        rrect.delete();
+                        thumbRect.delete();
                     }
                     thumbPaint.delete();
                 }
