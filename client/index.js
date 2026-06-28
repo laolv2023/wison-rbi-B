@@ -825,7 +825,7 @@ import {
                     const path = readPath(payload, 0);
                     // 计算 conicCount: 需要遍历 verbs 统计 kConic(3) 的数量
                     let conicCount = 0;
-                    if (verbCount > 0 && offset + 8 + verbCount <= payload.byteLength) {
+                    if (verbCount > 0 && 8 + verbCount <= payload.byteLength) {
                         for (let i = 0; i < verbCount; i++) {
                             if (payload.getUint8(8 + i) === 3) conicCount++;
                         }
@@ -1131,6 +1131,7 @@ import {
         let bytesRead = 18;
 
         // ── Shader (Phase 2: 变长渐变解析) ──
+        if (offset + bytesRead >= payload.byteLength) return paint;  // 边界保护
         const hasShader = payload.getUint8(offset + bytesRead);
         bytesRead += 1;
         if (hasShader) {
@@ -1142,17 +1143,19 @@ import {
         }
 
         // ── MaskFilter (Phase 3: placeholder skip) ──
-        // 实现后: 根据 maskType 反序列化具体 MaskFilter (如 Blur)
+        if (offset + bytesRead >= payload.byteLength) return paint;  // 边界保护
         const hasMask = payload.getUint8(offset + bytesRead);
         bytesRead += 1;
         if (hasMask) bytesRead += 8;  // BlurMaskFilter: style(4B) + sigma(4B)
 
         // ── ColorFilter (Phase 3: placeholder skip) ──
+        if (offset + bytesRead >= payload.byteLength) return paint;  // 边界保护
         const hasColorFilter = payload.getUint8(offset + bytesRead);
         bytesRead += 1;
         if (hasColorFilter) bytesRead += 16;  // matrix[20] placeholder
 
         // ── ImageFilter (Phase 3: placeholder skip) ──
+        if (offset + bytesRead >= payload.byteLength) return paint;  // 边界保护
         const hasImageFilter = payload.getUint8(offset + bytesRead);
         bytesRead += 1;
         if (hasImageFilter) bytesRead += 16;  // placeholder

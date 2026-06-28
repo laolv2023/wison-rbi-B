@@ -460,33 +460,35 @@ class CommandValidator {
                 break;
             }
 
-            // ── drawImage (0x40) / drawImageRect (0x41): 图像数据标记格式校验 ──
+            // ── drawImage (0x40) / drawImageRect (0x41): 图像引用格式校验 ──
             // 威胁: 未知/伪造的图像标记 → 渲染错误/资源泄漏
+            // 实际格式 (与 C++ writeImage + drawImage 一致):
+            //   flag(1B): 0x01 = hash-ref (SHA-256, 32B), 0x00 = inline (slot_id, 4B)
+            //   然后是 drawImage 的几何参数: left(4B) + top(4B) + sampling(variable) + paint_presence(1B) + [paint]
+            //   或 drawImageRect 的: src(16B) + dst(16B) + sampling(variable) + paint_presence(1B) + [paint] + constraint(1B)
             case OP.DRAW_IMAGE:
             case OP.DRAW_IMAGE_RECT: {
-                // 图像数据标记格式 (§4.1.4):
-                //   flag(1B): 0x01 = hash-ref (SHA-256, 32B), 0x00 = inline (raw data)
                 if (payLen < 1) return this._subReject('drawImage: payload too short');
                 const flag = payload.getUint8(0);
                 if (flag === 0x01) {
-                    // hash-ref: 需要 flag(1B) + hash(32B) + x(4B) + y(4B) = 41B 最低
-                    if (payLen < 41) return this._subReject('drawImage: hash-ref too short');
-                } else if (flag === 0x00) {
-                    // inline: flag(1B) + slot(4B) + dataSize(4B) + data[N] + x(4B) + y(4B)
-                    // 最低: 1+4+4+0+4+4 = 17B (dataSize=0)
-                    if (payLen < 17) return this._subReject('drawImage: inline too short');
-                    const dataSize = payload.getUint32(5, true);
-                    const minInline = 17 + dataSize;  // 确保坐标 x/y 在 payload 内
+                    // hash-ref: flag(1) + hash(32) + 几何参数
+                    // DRAW_IMAGE 最低: 1+32+4+4+3+1 = 45B (left+top+sampling(3B)+paint_presence)
+                    // DRAW_IMAGE_RECT 最低: 1+32+16+16+3+1+1 = 70B (src+dst+sampling+paint_presence+constraint)
                     if (opcode === OP.DRAW_IMAGE_RECT) {
-                        // 额外 32B: src(16B) + dst(16B)
-                        if (minInline + 32 > payLen) return this._subReject(
-                            `drawImageRect: inline overflow (need ${minInline + 32}, have ${payLen})`);
+                        if (payLen < 70) return this._subReject('drawImageRect: hash-ref too short');
                     } else {
-                        if (minInline > payLen) return this._subReject(
-                            `drawImage: inline overflow (need ${minInline}, have ${payLen})`);
+                        if (payLen < 45) return this._subReject('drawImage: hash-ref too short');
+                    }
+                } else if (flag === 0x00) {
+                    // inline: flag(1) + slot_id(4) + 几何参数
+                    // DRAW_IMAGE 最低: 1+4+4+4+3+1 = 17B (slot+left+top+sampling(3B)+paint_presence)
+                    // DRAW_IMAGE_RECT 最低: 1+4+16+16+3+1+1 = 42B (slot+src+dst+sampling+paint_presence+constraint)
+                    if (opcode === OP.DRAW_IMAGE_RECT) {
+                        if (payLen < 42) return this._subReject('drawImageRect: inline too short');
+                    } else {
+                        if (payLen < 17) return this._subReject('drawImage: inline too short');
                     }
                 } else {
-                    // 未知的 flag 值 — 可能为未来扩展或攻击
                     return this._subReject(`drawImage: unknown image flag ${flag}`);
                 }
                 break;
