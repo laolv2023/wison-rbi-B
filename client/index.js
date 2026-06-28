@@ -1179,8 +1179,12 @@ import {
             const shaderResult = readShader(payload, offset + bytesRead);
             if (shaderResult.shader) {
                 paint.setShader(shaderResult.shader);
+                bytesRead += shaderResult.bytesRead;
+            } else {
+                // FIX: shader 解析失败时，剩余 payload 不可信，直接返回 paint
+                // 避免在错误偏移上继续读取导致级联错误
+                return paint;
             }
-            bytesRead += shaderResult.bytesRead;
         }
 
         // ── MaskFilter (Phase 3: placeholder skip) ──
