@@ -1352,18 +1352,22 @@ import {
         const path = new canvasKit.Path();
         let ptIdx = 0;  // point index (each point = 2 floats)
         let weightIdx = 0;  // conic weight index
+        const maxPtIdx = pointCount * 2;  // points 数组边界
         for (let i = 0; i < verbCount; i++) {
             const verb = verbs[i];
             switch (verb) {
                 case 0: // moveTo - 1 point
+                    if (ptIdx + 1 >= maxPtIdx) { auditLog(LOG_LEVELS.WARN, 'readPath_pt_oob', { verb: 'move', i, ptIdx, maxPtIdx }); break; }
                     path.moveTo(points[ptIdx], points[ptIdx + 1]);
                     ptIdx += 2;
                     break;
                 case 1: // lineTo - 1 point
+                    if (ptIdx + 1 >= maxPtIdx) { auditLog(LOG_LEVELS.WARN, 'readPath_pt_oob', { verb: 'line', i, ptIdx, maxPtIdx }); break; }
                     path.lineTo(points[ptIdx], points[ptIdx + 1]);
                     ptIdx += 2;
                     break;
                 case 2: // quadTo - 2 points
+                    if (ptIdx + 3 >= maxPtIdx) { auditLog(LOG_LEVELS.WARN, 'readPath_pt_oob', { verb: 'quad', i, ptIdx, maxPtIdx }); break; }
                     path.quadTo(
                         points[ptIdx], points[ptIdx + 1],
                         points[ptIdx + 2], points[ptIdx + 3]
@@ -1371,6 +1375,8 @@ import {
                     ptIdx += 4;
                     break;
                 case 3: // conicTo - 2 points + 1 weight
+                    if (ptIdx + 3 >= maxPtIdx) { auditLog(LOG_LEVELS.WARN, 'readPath_pt_oob', { verb: 'conic', i, ptIdx, maxPtIdx }); break; }
+                    if (weightIdx >= conicCount) { auditLog(LOG_LEVELS.WARN, 'readPath_weight_oob', { i, weightIdx, conicCount }); break; }
                     path.conicTo(
                         points[ptIdx], points[ptIdx + 1],
                         points[ptIdx + 2], points[ptIdx + 3],
@@ -1380,6 +1386,7 @@ import {
                     weightIdx++;
                     break;
                 case 4: // cubicTo - 3 points
+                    if (ptIdx + 5 >= maxPtIdx) { auditLog(LOG_LEVELS.WARN, 'readPath_pt_oob', { verb: 'cubic', i, ptIdx, maxPtIdx }); break; }
                     path.cubicTo(
                         points[ptIdx], points[ptIdx + 1],
                         points[ptIdx + 2], points[ptIdx + 3],
