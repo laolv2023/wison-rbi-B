@@ -9,7 +9,7 @@
   "_comment__security": [
     "CSP: script-src 仅允许 'self' + 'wasm-unsafe-eval'，禁止外部脚本",
     "CSP: object-src 仅允许 'self'，禁止嵌入 Flash/Java 等外部插件",
-    "CSP: connect-src 仅允许 wss://，确保所有通信加密",
+    "CSP: connect-src 同时允许 ws:// 与 wss://，协议可由部署方按需选择（生产环境推荐 wss://）",
     "权限遵循最小化原则：declarativeNetRequest + storage + tabs",
     "web_accessible_resources 白名单控制哪些文件可被网页访问",
     "host_permissions 使用 <all_urls> 是必需的，因为需要拦截所有 HTTP 导航"
@@ -45,9 +45,9 @@
   "_comment__csp": "内容安全策略（CSP）：限制扩展页面的资源加载能力",
   "_comment__csp_script": "  script-src: 仅允许本扩展脚本 + WASM 执行（CanvasKit 需要 wasm-unsafe-eval）",
   "_comment__csp_object": "  object-src: 禁止所有插件对象（Flash、Java 等），防止第三方代码执行",
-  "_comment__csp_connect": "  connect-src: 仅允许 WebSocket Secure（wss://），防止明文通信",
+  "_comment__csp_connect": "  connect-src: 同时允许 WebSocket (ws://) 与 WebSocket Secure (wss://)，协议由部署方按需选择",
   "content_security_policy": {
-    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'; connect-src wss://*:*"
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'; connect-src ws://*:* wss://*:*"
   },
   "_comment__web_accessible_resources": "Web 可访问资源：白名单控制哪些扩展文件可被重定向后的页面引用",
   "_comment__war_details": "  - index.html/index.js 等为应用核心模块",
