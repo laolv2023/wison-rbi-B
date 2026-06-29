@@ -82,7 +82,7 @@ wison-rbi-B/
 │   ├── metrics.js                # 指标收集 + 告警 (counter/gauge/histogram, 396行)
 │   └── benchmark.js              # 性能基准测试工具 (369行)
 ├── client/                       # Chrome 扩展 (MV3) 客户端 (5227行)
-│   ├── package.json              # v1.6.0, 依赖: canvaskit-wasm/socket.io-client
+│   ├── package.json              # v1.6.0, 依赖: canvaskit-wasm
 │   ├── manifest.json             # MV3 扩展清单 (95行)
 │   ├── rules.json                # declarativeNetRequest 规则 (34行)
 │   ├── background.js             # Service Worker - 请求拦截 (211行)
@@ -1345,7 +1345,7 @@ node benchmark.js --iterations=100 --warmup=10
 | 依赖 | 版本 | 用途 |
 |------|------|------|
 | `canvaskit-wasm` | ^0.39.1 | Skia WASM 渲染引擎 |
-| `socket.io-client` | ^4.7.4 | WebSocket 客户端 |
+| 原生 WebSocket API | 浏览器内置 | WebSocket 客户端（无外部依赖） |
 
 ### 13.5 贡献指南
 
