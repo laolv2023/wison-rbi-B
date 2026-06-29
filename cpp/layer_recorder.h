@@ -70,6 +70,7 @@
 #include <memory>
 #include <vector>
 #include <mutex>
+#include <functional>
 
 namespace garnet {
 
