@@ -57,43 +57,54 @@ Wison-RBI:
 ## 2. 项目结构
 
 ```
-wison-rbi/
-├── cpp/                          # C++ Chromium 补丁层
-│   ├── garnet_config.h           # 编译时常量、硬上限定义
-│   ├── frame_constants.h         # 帧头结构体、opcode 枚举、协议常量
-│   ├── command_buffer.h          # CommandBuffer 声明
-│   ├── command_buffer.cpp        # CommandBuffer 实现 (序列化/CRC32)
-│   ├── recording_canvas.h        # RecordingCanvas 声明 (31个方法)
-│   └── layer_recorder.h          # LayerRecorder + FrameAssembler
-├── server/                       # Node.js 服务端
-│   ├── package.json
-│   ├── config.js                 # 运行时配置常量
-│   ├── server.js                 # 入口: WebSocket + 会话路由
-│   ├── session.js                # 会话管理 + frame_id 计数器
-│   ├── io_proxy.js               # CDP 输入代理 (HID→CDP)
-│   ├── chromium_manager.js       # Chromium 进程池管理
-│   ├── frame_builder.js          # 帧组装 + CRC32 + gzip
-│   ├── font_validator.js         # SFNT/WOFF2 Magic 校验
-│   ├── metrics.js                # 监控指标收集
-│   └── benchmark.js              # 性能基准测试
-├── client/                       # Chrome 扩展 (MV3) 客户端
-│   ├── package.json
-│   ├── manifest.json             # MV3 扩展清单
-│   ├── rules.json                # declarativeNetRequest 规则
-│   ├── background.js             # Service Worker
-│   ├── index.html                # 入口页面
-│   ├── index.js                  # 主控制器: 帧处理 + HID
-│   ├── command_validator.js      # 命令白名单 + 深度校验
-│   ├── protocol.js               # 协议常量
-│   ├── utils.js                  # CRC32, gzip, 日志
-│   ├── font_registry.js          # 客户端字体 LRU
-│   └── image_cache.js            # 图像 LRU 缓存
+wison-rbi-B/
+├── cpp/                          # C++ Chromium 补丁层 (7774行)
+│   ├── garnet_config.h           # 编译时常量、硬上限定义 (393行)
+│   ├── frame_constants.h         # 帧头结构体、opcode 枚举、协议常量 (235行)
+│   ├── command_buffer.h          # CommandBuffer 声明 (601行)
+│   ├── command_buffer.cpp        # CommandBuffer 实现 (序列化/CRC32, 1530行)
+│   ├── recording_canvas.h        # RecordingCanvas 声明 (31个方法, 420行)
+│   ├── recording_canvas.cpp      # RecordingCanvas 实现 (896行)
+│   ├── layer_recorder.h          # LayerRecorder + FrameAssembler 声明 (321行)
+│   ├── layer_recorder.cpp        # LayerRecorder + FrameAssembler 实现 (544行)
+│   ├── test_mocks.h              # Mock Skia 类型 (测试用, 1050行)
+│   ├── test_runner.cpp           # C++ 测试运行器 (120项集成测试, 1785行)
+│   └── TEST_PLAN.md              # C++ 测试方案文档 (226行)
+├── server/                       # Node.js 服务端 (4093行)
+│   ├── package.json              # v1.6.0, 依赖: ws/uuid/chrome-remote-interface
+│   ├── config.js                 # 运行时配置常量 (Object.freeze, 168行)
+│   ├── server.js                 # 入口: WebSocket + 会话路由 + 健康检查 (796行)
+│   ├── session.js                # 会话管理 + frame_id 计数器 + 帧历史 (385行)
+│   ├── io_proxy.js               # CDP 输入代理 (HID→CDP, 566行)
+│   ├── chromium_manager.js       # Chromium 进程池管理 + 崩溃恢复 (566行)
+│   ├── frame_builder.js          # 帧组装 + CRC32 + gzip + 图像去重 (656行)
+│   ├── font_validator.js         # SFNT/WOFF2 Magic 校验 (191行)
+│   ├── metrics.js                # 指标收集 + 告警 (counter/gauge/histogram, 396行)
+│   └── benchmark.js              # 性能基准测试工具 (369行)
+├── client/                       # Chrome 扩展 (MV3) 客户端 (5227行)
+│   ├── package.json              # v1.6.0, 依赖: canvaskit-wasm/socket.io-client
+│   ├── manifest.json             # MV3 扩展清单 (95行)
+│   ├── rules.json                # declarativeNetRequest 规则 (34行)
+│   ├── background.js             # Service Worker - 请求拦截 (211行)
+│   ├── index.html                # 入口页面 (152行)
+│   ├── index.js                  # 主控制器: 帧处理 + HID + CanvasKit (2413行)
+│   ├── command_validator.js      # 命令白名单 + 9层深度校验 (870行)
+│   ├── protocol.js               # 协议常量 (与C++/server三端一致, 307行)
+│   ├── utils.js                  # CRC32, gzip解压, 日志, 背压 (528行)
+│   ├── font_registry.js          # 客户端字体 LRU (64MB, Magic校验, 323行)
+│   └── image_cache.js            # 图像 LRU 缓存 (64MB, SHA-256去重, 243行)
 ├── protocol/
-│   └── opcodes.md                # Opcode 完整定义
+│   └── opcodes.md                # Opcode 完整定义 (0x01-0x7F, 含0x73 DRAW_SCROLLBAR)
+├── tests/                        # Node.js 测试套件 (200+ 用例, 2747行)
+│   ├── index.test.mjs            # 单元+集成测试 (340行)
+│   ├── advanced.test.mjs         # 协议层/会话/集成测试 (1519行)
+│   ├── extended.test.mjs         # 补充集成测试 (420行)
+│   └── fuzz.test.mjs             # 对抗性 Fuzzing 测试 (468行)
 ├── docs/
-│   └── Wison-RBI-技术文档.md      # 本文档
-├── README.md
-└── DEPLOYMENT.md
+│   └── Wison-RBI-技术文档.md      # 本文档 (v1.6)
+├── DEPLOYMENT.md                 # 部署指南 (Phase 5)
+├── AUDIT_AND_IMPL_PLAN_M143.md   # C++ 审计与实现方案 (Chromium M143)
+└── README.md
 ```
 
 ---

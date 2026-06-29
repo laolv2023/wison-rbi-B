@@ -58,6 +58,7 @@
 | `0x70` | FONT_DATA | fontId(u32) + size(u32) + data[N] |
 | `0x71` | IMAGE_DATA | slotId(u32) + size(u32) + data[N] |
 | `0x72` | SET_MATRIX | matrix(9×f32=36B) |
+| `0x73` | DRAW_SCROLLBAR | rect(16B) + vertical(u8) + position(f32) + thumb_size(f32) |
 | `0x7F` | NOOP | 无 |
 
 ## Payload 注意事项

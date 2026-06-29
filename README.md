@@ -29,30 +29,46 @@ wison-rbi/
 │   ├── command_buffer.h          # CommandBuffer 声明
 │   ├── command_buffer.cpp        # CommandBuffer 实现 (序列化/CRC32)
 │   ├── recording_canvas.h        # RecordingCanvas 声明 (31个方法)
-│   └── layer_recorder.h          # LayerRecorder + FrameAssembler
+│   ├── recording_canvas.cpp      # RecordingCanvas 实现
+│   ├── layer_recorder.h          # LayerRecorder + FrameAssembler 声明
+│   ├── layer_recorder.cpp        # LayerRecorder + FrameAssembler 实现
+│   ├── test_mocks.h              # Mock Skia 类型 (测试用)
+│   ├── test_runner.cpp           # C++ 测试运行器 (120项集成测试)
+│   └── TEST_PLAN.md              # C++ 测试方案文档
 ├── server/                       # Node.js 服务端
 │   ├── package.json
-│   ├── config.js                 # 运行时配置常量
-│   ├── server.js                 # 入口: WebSocket + 会话路由
-│   ├── session.js                # 会话管理 + frame_id 计数器
+│   ├── config.js                 # 运行时配置常量 (Object.freeze)
+│   ├── server.js                 # 入口: WebSocket + 会话路由 + 健康检查
+│   ├── session.js                # 会话管理 + frame_id 计数器 + 帧历史
 │   ├── io_proxy.js               # CDP 输入代理 (HID→CDP)
-│   ├── chromium_manager.js       # Chromium 进程池管理
-│   ├── frame_builder.js          # 帧组装 + CRC32 + gzip
-│   └── font_validator.js         # SFNT/WOFF2 Magic 校验
+│   ├── chromium_manager.js       # Chromium 进程池管理 + 崩溃恢复
+│   ├── frame_builder.js          # 帧组装 + CRC32 + gzip + 图像去重
+│   ├── font_validator.js         # SFNT/WOFF2 Magic 校验
+│   ├── metrics.js                # 指标收集 + 告警 (counter/gauge/histogram)
+│   └── benchmark.js              # 性能基准测试工具
 ├── client/                       # Chrome 扩展 (MV3) 客户端
 │   ├── package.json
 │   ├── manifest.json             # MV3 扩展清单
 │   ├── rules.json                # declarativeNetRequest 规则
-│   ├── background.js             # Service Worker (MV3)
+│   ├── background.js             # Service Worker (MV3) - 请求拦截
 │   ├── index.html                # 入口页面
-│   ├── index.js                  # 主控制器: 帧处理 + HID
-│   ├── command_validator.js      # 命令白名单 + 深度校验
-│   ├── protocol.js               # 协议常量
-│   ├── utils.js                  # CRC32, gzip, 日志
-│   ├── font_registry.js          # 客户端字体 LRU
-│   └── image_cache.js            # 图像 LRU 缓存
+│   ├── index.js                  # 主控制器: 帧处理 + HID + CanvasKit
+│   ├── command_validator.js      # 命令白名单 + 9层深度校验
+│   ├── protocol.js               # 协议常量 (与C++/server三端一致)
+│   ├── utils.js                  # CRC32, gzip解压, 日志, 背压
+│   ├── font_registry.js          # 客户端字体 LRU (64MB, Magic校验)
+│   └── image_cache.js            # 图像 LRU 缓存 (64MB, SHA-256去重)
 ├── protocol/
-│   └── opcodes.md                # Opcode 完整定义
+│   └── opcodes.md                # Opcode 完整定义 (0x01-0x7F)
+├── tests/                        # Node.js 测试套件 (200+ 用例)
+│   ├── index.test.mjs            # 单元+集成测试 (200+ cases)
+│   ├── advanced.test.mjs         # 协议层/会话/集成测试 (170+ cases)
+│   ├── extended.test.mjs         # 补充集成测试 (40 cases)
+│   └── fuzz.test.mjs             # 对抗性 Fuzzing 测试 (Phase 4)
+├── docs/
+│   └── Wison-RBI-技术文档.md      # 全面的技术文档 (v1.6)
+├── DEPLOYMENT.md                 # 部署指南 (Phase 5)
+├── AUDIT_AND_IMPL_PLAN_M143.md   # C++ 审计与实现方案 (Chromium M143)
 └── README.md
 ```
 
@@ -89,6 +105,21 @@ CHROMIUM_PATH=/usr/bin/chromium PORT=3000 node server.js
 # 2. 启用"开发者模式"
 # 3. "加载已解压的扩展程序" → 选择 client/ 目录
 ```
+
+### 测试
+
+```bash
+# Node.js 测试套件 (200+ 用例)
+cd server
+npm test
+
+# 或直接运行
+node --test tests/
+```
+
+> **注意**: 客户端使用 `socket.io-client` 库，服务端使用 `ws` 库。两者协议不兼容。
+> 当前架构中客户端通过 socket.io 的 `frame` 事件接收二进制帧，服务端需适配 socket.io 协议层。
+> 生产部署前需统一 WebSocket 库（建议服务端改用 `socket.io` 或客户端改用原生 `WebSocket`）。
 
 ---
 

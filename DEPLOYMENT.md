@@ -163,6 +163,20 @@ const CONFIG = Object.freeze({
 }
 ```
 
+### 3.4 WebSocket 库兼容性说明
+
+> **重要**: 当前版本存在客户端与服务端 WebSocket 库不兼容的已知问题:
+> - **客户端** (`client/package.json`): 依赖 `socket.io-client ^4.7.4`，使用 socket.io 协议
+> - **服务端** (`server/package.json`): 依赖 `ws ^8.x`，使用原生 WebSocket 协议
+>
+> socket.io 在 WebSocket 之上增加了自定义协议层（Engine.IO），无法直接连接 `ws` 服务器。
+>
+> **解决方案（二选一）**:
+> 1. **服务端改用 socket.io**: `npm install socket.io`，将 `server.js` 中的 `WsServer` 替换为 `io(server)`
+> 2. **客户端改用原生 WebSocket**: 移除 `socket.io-client` 依赖，`client/index.js` 中使用 `new WebSocket(url)` 并自行实现重连逻辑
+>
+> **建议**: 生产部署前必须解决此兼容性问题，否则客户端无法连接服务端。
+
 ---
 
 ## 4. TLS 配置
