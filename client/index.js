@@ -1308,7 +1308,13 @@ import {
         if (hasShader) {
             const shaderResult = readShader(payload, offset + bytesRead);
             if (shaderResult.shader) {
-                paint.setShader(shaderResult.shader);
+                // FIX-R27: setShader 异常时删除 shader 防止泄漏
+                try {
+                    paint.setShader(shaderResult.shader);
+                } catch (e) {
+                    shaderResult.shader.delete();
+                    throw e;
+                }
                 bytesRead += shaderResult.bytesRead;
             } else {
                 // FIX: shader 解析失败时，剩余 payload 不可信，直接返回 paint
