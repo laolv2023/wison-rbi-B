@@ -41,21 +41,7 @@
 
 #include "recording_canvas.h"
 
-#include "include/core/SkColorPriv.h"       // SkColorGetR, SkColorGetG, SkColorGetB, SkColorGetA
-#include "include/core/SkMatrix.h"         // SkMatrix::operator[]
-#include "include/core/SkImage.h"          // SkImage (完整类型)
-#include "include/core/SkGlyphRunList.h"   // SkGlyphRunList iteration
-#include "include/core/SkRSXform.h"        // SkRSXform::fSCos, fSSin, fTX, fTY
-#include "include/core/SkDrawShadowRec.h"  // SkDrawShadowRec full type
-#include "include/core/SkSamplingOptions.h"
-#include "include/core/SkVertices.h"
-#include "include/core/SkTextBlob.h"
-#include "include/core/SkPath.h"
-#include "include/core/SkRRect.h"
-#include "include/core/SkRect.h"
-#include "include/core/SkM44.h"
-#include "include/core/SkData.h"
-#include "include/core/SkBlendMode.h"
+#include "garnet_standalone.h"  // Skia 头文件（条件编译）
 
 #include <cstdio>
 
