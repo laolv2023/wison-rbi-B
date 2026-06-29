@@ -1,0 +1,51 @@
+# docker-compose.yml — Wison-RBI Garnet 模块编译服务
+#
+# 用法:
+#   docker compose -f docker/docker-compose.yml run --rm chromium-builder
+#
+# 参数传递:
+#   docker compose -f docker/docker-compose.yml run --rm chromium-builder --run-tests
+#   docker compose -f docker/docker-compose.yml run --rm chromium-builder --skip-fetch --skip-build
+#
+# 环境要求（宿主机）:
+#   - 磁盘: >= 120GB（映射到 ./chromium-build）
+#   - 内存: >= 16GB
+#   - CPU: >= 8 核
+#
+
+services:
+  chromium-builder:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.chromium-builder
+    image: wison-rbi-builder:latest
+    container_name: wison-rbi-builder
+
+    # 资源限制
+    cpus: 16
+    mem_limit: 32g
+    memswap_limit: 32g
+
+    # 卷映射
+    volumes:
+      # Chromium 源码（持久化，避免重复下载）
+      - ./chromium-build:/opt/chromium
+      # 仓库源码
+      - ..:/repo:ro
+      # depot_tools 缓存
+      - ./depot-tools-cache:/opt/depot_tools
+
+    # 环境变量
+    environment:
+      - CHROMIUM_SRC=/opt/chromium/src
+      - DEPOT_TOOLS_DIR=/opt/depot_tools
+      - JOBS=16
+
+    # 网络模式（需要访问 Google 源码仓库）
+    network_mode: host
+
+    # 重启策略
+    restart: "no"
+
+    # 入口点参数
+    command: []
