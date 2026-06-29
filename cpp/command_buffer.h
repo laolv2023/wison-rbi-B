@@ -57,9 +57,8 @@
 #include <vector>
 
 // sk_sp<T> 智能指针 — Skia 线程安全引用计数 (§4.1.4 并发模型)
-// 在 Chromium 源码树中编译路径: third_party/skia/include/core/SkRefCnt.h
-// 对于独立编译 (如 Node.js native addon): 需确保 Skia include path 已配置
-#include "include/core/SkRefCnt.h"
+// 通过条件编译开关选择 Mock（独立编译）或真实 Skia（Chromium 集成）
+#include "garnet_standalone.h"
 
 // 前向声明 Skia 类型（不引入完整 Skia 头以减少编译依赖）
 class SkImage;
