@@ -66,13 +66,16 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
 
     // 构建重定向 URL —— 目标页面为扩展内置的 index.html
     // 原始 URL 作为查询参数传递，由 index.js 解析后在隔离环境中加载
-    const redirectUrl = `${EXTENSION_PAGE}?url=${encodeURIComponent(changeInfo.url)}`;
+    let redirectUrl = `${EXTENSION_PAGE}?url=${encodeURIComponent(changeInfo.url)}`;
 
-    // 更新标签页 —— catch 处理执行失败的情况
-    // 典型失败场景：受保护页面（chrome://、edge://等）不允许扩展导航
-    chrome.tabs.update(tabId, { url: redirectUrl }).catch(err => {
-        // 可能因为权限不足而失败 — 此时依赖 declarativeNetRequest 规则
-        console.debug('[wison-rbi] tabs.update fallback failed:', err.message);
+    // 读取配置的服务器地址（通过 storage API），若已配置则附加到重定向 URL
+    chrome.storage.local.get(['serverUrl'], (result) => {
+        if (result.serverUrl) {
+            redirectUrl += `&server=${encodeURIComponent(result.serverUrl)}`;
+        }
+        chrome.tabs.update(tabId, { url: redirectUrl }).catch(err => {
+            console.debug('[wison-rbi] tabs.update fallback failed:', err.message);
+        });
     });
 });
 
