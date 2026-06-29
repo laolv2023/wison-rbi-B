@@ -283,10 +283,13 @@ const PROTOCOL = Object.freeze({
      * 该映射用于 CommandValidator._validatePaintShader() 的边界检查。
      */
     SHADER_HEADER_SIZE: {
-        0x01: 20,  // LinearGradient: sx,sy,ex,ey (4×f32) + tileMode + colorCount + 2B pad
-        0x02: 20,  // RadialGradient: cx,cy,r (3×f32) + _pad(4B) + tileMode + colorCount + 2B pad
-        0x03: 20,  // SweepGradient:  cx,cy,sa,ea (4×f32) + tileMode + colorCount + 2B pad
-        0x04: 28,  // Conical:       sx,sy,sr,ex,ey,er (6×f32) + tileMode + colorCount + 2B pad
+        // FIX-R21: headerSize 包含 shaderType 字节 (1B)。
+        // 原值不包含 shaderType，导致 tileMode/colorCount/colorStops 偏移全部少 1 字节。
+        // C++ writePaint shader 格式: shaderType(1B) + 几何参数 + tileMode(1B) + colorCount(1B) + _pad(2B)
+        0x01: 21,  // LinearGradient: shaderType(1) + sx,sy,ex,ey (4×f32=16) + tileMode(1) + colorCount(1) + 2B pad = 21
+        0x02: 21,  // RadialGradient: shaderType(1) + cx,cy,r (3×f32=12) + _pad(4) + tileMode(1) + colorCount(1) + 2B pad = 21
+        0x03: 21,  // SweepGradient:  shaderType(1) + cx,cy,sa,ea (4×f32=16) + tileMode(1) + colorCount(1) + 2B pad = 21
+        0x04: 29,  // Conical:       shaderType(1) + sx,sy,sr,ex,ey,er (6×f32=24) + tileMode(1) + colorCount(1) + 2B pad = 29
     },
 
     // ── 渐变颜色停止点最大数量 ──
