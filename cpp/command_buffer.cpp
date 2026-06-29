@@ -586,9 +586,16 @@ void CommandBuffer::writePath(const SkPath& path) {
     int pointCount = path.countPoints();
 
     // Bounds check (§8.4 深度校验): verbCount ≤ kMaxPathVerbs, pointCount ≤ kMaxPathPoints
+    // FIX-R31: 超限时写入空 path 结构 (verbCount=0, pointCount=0) 而非提前返回。
+    // 原实现 return 后，调用方 (drawPath/clipPath/drawShadow) 的 safeCommand lambda 继续写入后续字段，
+    // 但客户端期望 verbCount + pointCount + [verbs] + [points] + [conicWeights] 结构，
+    // 缺少 verbCount/pointCount 会导致客户端将后续数据误读为 count 字段，造成协议反序列化错位。
+    // 与 writeTextBlob (FIX-R17) 和 writeVertices (FIX-R17) 保持一致的降级策略。
     if (static_cast<uint32_t>(verbCount) > kMaxPathVerbs ||
         static_cast<uint32_t>(pointCount) > kMaxPathPoints) {
-        return;  // Degrade: skip oversized path (avoid OOM)
+        writeU32(0);  // verbCount=0: 客户端检测到后 graceful skip
+        writeU32(0);  // pointCount=0
+        return;       // 无 verbs/points/conicWeights 需要写入
     }
 
     writeU32(static_cast<uint32_t>(verbCount));

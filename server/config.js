@@ -56,6 +56,9 @@ module.exports = Object.freeze({
     // ── 路径/文本子结构上限 ──
     // 针对 Skia 特定 API 的参数上限，防止恶意构造的几何/字形数据。
     MAX_PATH_VERBS: 100000,        // SkPath 动词（moveTo/lineTo/cubicTo 等）上限
+    // FIX-R31: 与 C++ garnet_config.h kMaxPathPoints=300000 对齐。
+    //   每个 verb 最多产生 3 个点 (cubicTo)，因此 pointCount 上限为 verbCount 的 3 倍。
+    MAX_PATH_POINTS: 300000,       // SkPath 点坐标上限 (verbCount × 3)
     MAX_TEXT_BLOB_GLYPHS: 50000,   // 单次 drawTextBlob 字形数上限
     MAX_VERTICES_COUNT: 100000,    // drawVertices 顶点数上限
     MAX_ATLAS_COUNT: 100000,       // drawAtlas 精灵数上限
