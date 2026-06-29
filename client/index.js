@@ -3,7 +3,7 @@
 // ## 模块角色 (§5.5 客户端设计 — 核心逻辑)
 //   客户端唯一的 JavaScript 入口，协调所有子系统完成以下职责:
 //   1. CanvasKit WASM 初始化 (Skia 图形引擎的浏览器版本)
-//   2. WebSocket 连接管理 (socket.io, 自动重连, 背压处理)
+//   2. WebSocket 连接管理 (原生 WebSocket, 自动重连, 背压处理)
 //   3. 帧接收流水线: 解压 → CRC校验 → 版本检查 → 命令白名单校验 → CanvasKit 重放
 //   4. HID 事件捕获 (鼠标坐标/按钮、键盘键码/修饰键、滚轮增量)
 //   5. 视口管理 (resize 防抖, 150ms)
@@ -18,7 +18,7 @@
 //   - 浏览器敏感快捷键 (Ctrl+T/W/N/Q/R 等) 被拦截, 不发往服务端
 //
 // ## 性能设计
-//   - handleFrame 使用 socket.io 的单线程消息处理模型 (简化并发控制)
+//   - handleFrame 使用 WebSocket 的单线程消息处理模型 (简化并发控制)
 //   - 最新帧策略: 如果上一帧正在渲染 (renderScheduled=true), 新帧覆盖 pendingFrameId
 //   - 渲染循环在 requestAnimationFrame 中执行 (同步到浏览器刷新率)
 //   - ±1ms 渲染抖动已启用 (Phase 2 侧信道防御, CONFIG.JITTER_ENABLED)
@@ -71,7 +71,7 @@ import {
         SERVER_URL: 'wss://localhost:3000',
         /** DOM 中 Canvas 元素的 id 属性值 */
         CANVAS_ID: 'main',
-        /** 重连初始延迟 (ms) — socket.io 指数退避的基准值 */
+        /** 重连初始延迟 (ms) — 指数退避的基准值 */
         RECONNECT_DELAY_MS: 1000,
         /** 重连最大延迟 (ms) — 上限 30 秒 */
         MAX_RECONNECT_DELAY_MS: 30000,
@@ -87,7 +87,7 @@ import {
     // 全局状态
     //
     // 所有可变状态集中管理，便于调试和审计。
-    // 注意: socket.io 的事件处理是单线程的 (基于 EventEmitter)，
+    // 注意: WebSocket 的事件处理是单线程的 (基于 EventEmitter)，
     // 所以不需要显式的互斥锁。
     // ═══════════════════════════════════════════════════════════
 
@@ -107,8 +107,8 @@ import {
     /** 当前活跃字体 ID — FONT_DATA 设置，TEXT_BLOB 消费 */
     let currentFontId = 0;       // 当前字体 ID（默认 0 = 回退字体）
 
-    /** WebSocket 连接实例 (socket.io) */
-    let socket = null;            // WebSocket (socket.io)
+    /** WebSocket 连接实例 (原生 WebSocket) */
+    let socket = null;            // WebSocket (原生)
     /** 当前最新渲染帧 ID — 用于单调性检测和输入同步 */
     let currentFrameId = 0;      // 当前渲染帧 ID
     /**
@@ -124,7 +124,7 @@ import {
     /** 是否已调度 requestAnimationFrame 回调 — 防止重复调度 */
     let renderScheduled = false; // 是否已调度渲染
 
-    /** 当前重连尝试次数 (由 socket.io 回调更新) */
+    /** 当前重连尝试次数 (由重连定时器更新) */
     let reconnectAttempt = 0;
 
     // ═══════════════════════════════════════════════════════════
@@ -224,93 +224,125 @@ import {
     // ═══════════════════════════════════════════════════════════
     // WebSocket 连接 (§6.1 协议总览)
     //
-    // 使用 socket.io 库 (WebSocket 上层封装)。
-    // 传输层: 强制仅使用 WebSocket (upgrade: false)，不降级到 HTTP 轮询。
-    // 重连: 指数退避，从 1s 到 30s (socket.io 内置)。
+    // 使用原生 WebSocket API (无 socket.io 依赖)。
+    // 重连: 指数退避，从 1s 到 30s (自行实现)。
     //
     // 事件流:
-    //   connect → 发送 viewport + ready → 接收 frame 流
+    //   open → 发送 viewport + ready → 接收 frame 流 (二进制消息)
     //   断开 → 显示覆盖层 → 自动重连
     //   重连失败 → 显示手动刷新提示
     //
-    // 安全: socket.io 连接应通过 TLS 1.3 (wss://)，本文不涉及 TLS 配置。
+    // 消息格式:
+    //   客户端 → 服务端: JSON 文本消息 {type: "ready", url: "..."} / {type: "viewport", ...}
+    //   服务端 → 客户端: 二进制帧 (ArrayBuffer) 或 JSON 文本消息 {type: "error", ...}
+    //
+    // 安全: WebSocket 连接应通过 TLS 1.3 (wss://)，本文不涉及 TLS 配置。
     // ═══════════════════════════════════════════════════════════
+
+    /** 重连定时器句柄 */
+    let reconnectTimer = null;
 
     /**
      * 建立 WebSocket 连接并注册事件处理器。
      *
-     * 副作用: 创建全局 socket 实例，注册 on('frame'), on('disconnect') 等回调。
+     * 副作用: 创建全局 socket 实例，注册 onopen/onmessage/onclose/onerror 回调。
      *
      * @param {string} targetUrl - 服务端应导航到的目标 URL
      */
     function connect(targetUrl) {
         // 先断开旧连接 (重连场景)
         if (socket) {
-            socket.disconnect();
+            try { socket.close(); } catch (e) {}
+            socket = null;
+        }
+        if (reconnectTimer) {
+            clearTimeout(reconnectTimer);
+            reconnectTimer = null;
         }
 
-        // 创建 socket.io 连接，强制 WebSocket 传输
-        socket = io(CONFIG.SERVER_URL, {
-            transports: ['websocket'],
-            upgrade: false,           // 只用 WebSocket，不降级到长轮询
-            reconnection: true,
-            reconnectionDelay: CONFIG.RECONNECT_DELAY_MS,
-            reconnectionDelayMax: CONFIG.MAX_RECONNECT_DELAY_MS,
-        });
+        // 创建原生 WebSocket 连接
+        socket = new WebSocket(CONFIG.SERVER_URL);
+        socket.binaryType = 'arraybuffer';  // 接收二进制帧为 ArrayBuffer
 
         // ── 连接成功 ──
-        socket.on('connect', () => {
+        socket.onopen = () => {
             reconnectAttempt = 0;
             auditLog(LOG_LEVELS.INFO, 'ws_connected');
 
             // 上报当前视口尺寸，服务端据此设置 Chromium 窗口大小 (§6.3)
-            socket.emit('viewport', {
+            socket.send(JSON.stringify({
+                type: 'viewport',
                 width: window.innerWidth,
                 height: window.innerHeight,
                 devicePixelRatio: window.devicePixelRatio,
-            });
+            }));
 
-            // 发送 ready 事件，携带目标 URL, 触发服务端导航 (§6.1)
-            socket.emit('ready', { url: targetUrl });
-        });
+            // 发送 ready 消息，携带目标 URL, 触发服务端导航 (§6.1)
+            socket.send(JSON.stringify({
+                type: 'ready',
+                url: targetUrl,
+            }));
+        };
 
-        // ── 帧到达 (核心数据通道) ──
-        // frameData 是二进制 ArrayBuffer (gzip 压缩的帧)
-        socket.on('frame', handleFrame);
-
-        // ── 服务端错误 ──
-        socket.on('error', (data) => {
-            auditLog(LOG_LEVELS.ERROR, 'server_error', data);
-        });
+        // ── 消息到达 (核心数据通道) ──
+        socket.onmessage = (event) => {
+            if (event.data instanceof ArrayBuffer) {
+                // 二进制帧 — 交给帧处理流水线
+                handleFrame(event.data);
+            } else if (typeof event.data === 'string') {
+                // JSON 文本消息 — 解析并路由
+                try {
+                    const msg = JSON.parse(event.data);
+                    if (msg.type === 'error') {
+                        auditLog(LOG_LEVELS.ERROR, 'server_error', msg);
+                    } else if (msg.type === 'version_error' || msg.code === 'PROTOCOL_VERSION_MISMATCH') {
+                        auditLog(LOG_LEVELS.ERROR, 'protocol_version_mismatch', msg);
+                        showFatalError(
+                            `Protocol version mismatch. Server: ${PROTOCOL.VERSION}. ` +
+                            `Please update your client.`
+                        );
+                    }
+                } catch (e) {
+                    // 非 JSON 文本消息 — 忽略
+                }
+            }
+        };
 
         // ── 断开连接 ──
-        socket.on('disconnect', (reason) => {
-            auditLog(LOG_LEVELS.WARN, 'ws_disconnected', { reason });
+        socket.onclose = (event) => {
+            const reason = event.reason || `code ${event.code}`;
+            auditLog(LOG_LEVELS.WARN, 'ws_disconnected', { reason, code: event.code });
             // 在 Canvas 上显示断线覆盖层 (§8.1)
             showDisconnectedOverlay(`Disconnected — reconnecting... (${reason})`);
-        });
 
-        // ── 重连尝试计数 ──
-        socket.on('reconnect_attempt', (attempt) => {
-            reconnectAttempt = attempt;
-        });
+            // 自动重连（指数退避）
+            scheduleReconnect(targetUrl);
+        };
 
-        // ── 重连彻底失败 ──
-        socket.on('reconnect_failed', () => {
-            auditLog(LOG_LEVELS.ERROR, 'ws_reconnect_failed');
-            // 最终失败 → 提示用户手动刷新
-            showDisconnectedOverlay('Connection failed. Please reload the page.');
-        });
+        // ── 连接错误 ──
+        socket.onerror = () => {
+            // onclose 会随后触发，重连逻辑在 onclose 中处理
+            auditLog(LOG_LEVELS.ERROR, 'ws_error');
+        };
+    }
 
-        // ── 协议版本不匹配 ──
-        // 服务端检测到客户端版本不兼容时发送 (§6.5)
-        socket.on('version_error', (data) => {
-            auditLog(LOG_LEVELS.ERROR, 'protocol_version_mismatch', data);
-            showFatalError(
-                `Protocol version mismatch. Server: ${PROTOCOL.VERSION}. ` +
-                `Please update your client.`
-            );
-        });
+    /**
+     * 指数退避重连调度。
+     *
+     * @param {string} targetUrl - 重连时传递的目标 URL
+     */
+    function scheduleReconnect(targetUrl) {
+        reconnectAttempt++;
+        const delay = Math.min(
+            CONFIG.RECONNECT_DELAY_MS * Math.pow(2, reconnectAttempt - 1),
+            CONFIG.MAX_RECONNECT_DELAY_MS
+        );
+        auditLog(LOG_LEVELS.INFO, 'ws_reconnect_attempt', { attempt: reconnectAttempt, delayMs: delay });
+
+        reconnectTimer = setTimeout(() => {
+            reconnectTimer = null;
+            connect(targetUrl);
+        }, delay);
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -332,18 +364,18 @@ import {
     //
     // 最新帧策略: 如果 renderScheduled=true (上一帧还在处理)，
     // 只需更新 pendingFrameId。渲染循环会自动处理最新的 pending 帧。
-    // socket.io 保证单线程消息处理，renderScheduled 无需原子操作。
+    // WebSocket 保证单线程消息处理，renderScheduled 无需原子操作。
     //
     // 连续拒绝检测: 任何步骤失败 → validator.consecutiveRejects++。
     // 达到 CONSECTIVE_REJECT_THRESHOLD (3) → request_keyframe。
     // ═══════════════════════════════════════════════════════════
 
     /**
-     * 帧处理主入口 (socket.io 'frame' 事件回调)。
+     * 帧处理主入口 (WebSocket onmessage 回调)。
      *
-     * 此函数在 socket.io 的消息处理线程中同步执行。
+     * 此函数在 WebSocket 的消息处理回调中同步执行。
      * 解压 (decompressWithProtection) 是唯一的异步操作，
-     * 但 socket.io 保证单消息串行处理。
+     * 但 WebSocket 保证单消息串行处理。
      *
      * @param {ArrayBuffer|Uint8Array} frameData - 服务端发送的压缩帧数据
      * @returns {Promise<void>}
@@ -377,7 +409,7 @@ import {
                 auditLog(LOG_LEVELS.WARN, 'frame_crc_mismatch');
                 validator.consecutiveRejects++;
                 if (validator.consecutiveRejects >= PROTOCOL.LIMITS.CONSECUTIVE_REJECT_THRESHOLD) {
-                    socket.emit('request_keyframe');
+                    socket.send(JSON.stringify({ type: 'request_keyframe' }));
                     auditLog(LOG_LEVELS.WARN, 'request_keyframe_crc');
                 }
                 return;
@@ -394,10 +426,13 @@ import {
                     expected: PROTOCOL.VERSION,
                     received: header.version,
                 });
-                socket.emit('version_error', {
-                    clientVersion: PROTOCOL.VERSION,
-                    receivedVersion: header.version,
-                });
+                socket.send(JSON.stringify({
+                    type: 'version_error',
+                    data: {
+                        clientVersion: PROTOCOL.VERSION,
+                        receivedVersion: header.version,
+                    },
+                }));
                 return;
             }
 
@@ -424,7 +459,7 @@ import {
                 frameMetadata.clear();
                 imageCache.clear();
                 fontRegistry.clear();
-                socket.emit('request_keyframe');
+                socket.send(JSON.stringify({ type: 'request_keyframe' }));
             }
 
             // 情况 B: frame_id 跳跃超过阈值 (FRAME_ID_JUMP_THRESHOLD=1000)
@@ -436,7 +471,7 @@ import {
                     to: header.frameId,
                     diff: frameIdDiff,
                 });
-                socket.emit('request_keyframe');
+                socket.send(JSON.stringify({ type: 'request_keyframe' }));
             }
 
             currentFrameId = header.frameId;
@@ -460,7 +495,7 @@ import {
                 });
                 validator.consecutiveRejects++;
                 if (validator.consecutiveRejects >= PROTOCOL.LIMITS.CONSECUTIVE_REJECT_THRESHOLD) {
-                    socket.emit('request_keyframe');
+                    socket.send(JSON.stringify({ type: 'request_keyframe' }));
                 }
                 return;
             }
@@ -473,7 +508,7 @@ import {
                 });
 
                 if (validation.shouldRequestKeyframe) {
-                    socket.emit('request_keyframe');
+                    socket.send(JSON.stringify({ type: 'request_keyframe' }));
                 }
                 return;  // 丢弃帧 — 不部分渲染
             }
@@ -542,7 +577,7 @@ import {
 
             validator.consecutiveRejects++;
             if (validator.consecutiveRejects >= PROTOCOL.LIMITS.CONSECUTIVE_REJECT_THRESHOLD) {
-                socket.emit('request_keyframe');
+                socket.send(JSON.stringify({ type: 'request_keyframe' }));
             }
         }
     }
@@ -2071,8 +2106,8 @@ import {
 
         // ── 鼠标事件 ──
         const mouseHandler = (e) => {
-            if (!socket || !socket.connected) return;
-            socket.emit('io', {
+            if (!socket || socket.readyState !== 1) return;
+            socket.send(JSON.stringify({ type: 'io', data: {
                 type: e.type,  // 'mousemove'/'mousedown'/'mouseup'
                 x: Math.round(e.offsetX),
                 y: Math.round(e.offsetY),
@@ -2090,7 +2125,7 @@ import {
         // 禁止右键菜单 (转发为 mousedown button=2)
         canvas.addEventListener('contextmenu', (e) => {
             e.preventDefault();
-            socket.emit('io', {
+            socket.send(JSON.stringify({ type: 'io', data: {
                 type: 'mousedown',
                 x: Math.round(e.offsetX),
                 y: Math.round(e.offsetY),
@@ -2102,8 +2137,8 @@ import {
 
         // ── 滚轮 ──
         canvas.addEventListener('wheel', (e) => {
-            if (!socket || !socket.connected) return;
-            socket.emit('io', {
+            if (!socket || socket.readyState !== 1) return;
+            socket.send(JSON.stringify({ type: 'io', data: {
                 type: 'wheel',
                 x: Math.round(e.offsetX),
                 y: Math.round(e.offsetY),
@@ -2119,7 +2154,7 @@ import {
         document.addEventListener('keyup', keyHandler, true);
 
         function keyHandler(e) {
-            if (!socket || !socket.connected) return;
+            if (!socket || socket.readyState !== 1) return;
 
             // 敏感快捷键过滤
             if (isBrowserShortcut(e)) {
@@ -2127,7 +2162,7 @@ import {
                 return;
             }
 
-            socket.emit('io', {
+            socket.send(JSON.stringify({ type: 'io', data: {
                 type: e.type,
                 key: e.key,
                 code: e.code,
@@ -2247,12 +2282,13 @@ import {
         window.addEventListener('resize', () => {
             clearTimeout(resizeTimer);
             resizeTimer = setTimeout(() => {
-                if (socket && socket.connected) {
-                    socket.emit('viewport', {
+                if (socket && socket.readyState === 1) {
+                    socket.send(JSON.stringify({
+                        type: 'viewport',
                         width: window.innerWidth,
                         height: window.innerHeight,
                         devicePixelRatio: window.devicePixelRatio,
-                    });
+                    }));
                 }
             }, CONFIG.VIEWPORT_RESIZE_DEBOUNCE_MS);
         });
