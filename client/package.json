@@ -9,7 +9,7 @@
   "_comment__security": [
     "依赖锁定为固定大版本（^），定期审查安全公告",
     "canvaskit-wasm 版本锁定在 0.39.x，跨大版本可能引入 API 变更",
-    "socket.io-client 锁定在 4.7.x，生产环境强制使用 wss:// 连接",
+    "原生 WebSocket API（浏览器内置），生产环境强制使用 wss:// 连接",
     "Node.js 最低版本 18，确保安全补丁和 WASM 支持"
   ],
   "name": "wison-rbi-client",
@@ -25,10 +25,9 @@
   },
   "_comment__dependencies": "运行时依赖：",
   "_comment__deps_canvaskit": "  canvaskit-wasm — Skia 图形库的 WebAssembly 移植，提供 2D 渲染 API",
-  "_comment__deps_socketio": "  socket.io-client — Socket.IO 客户端库，实现与服务器的 WebSocket 双向通信",
+  "_comment__deps_native_ws": "  原生 WebSocket API — 浏览器内置，无外部依赖（已移除 socket.io-client）",
   "dependencies": {
-    "canvaskit-wasm": "^0.39.1",
-    "socket.io-client": "^4.7.4"
+    "canvaskit-wasm": "^0.39.1"
   },
   "_comment__engines": "Node.js 版本要求：>= 18.0.0（用于 npm install，不用于运行扩展）",
   "engines": {
