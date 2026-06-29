@@ -1406,7 +1406,10 @@ import {
         }
         const verbCount = payload.getUint32(offset, true);
         const pointCount = payload.getUint32(offset + 4, true);
-        if (verbCount > 100000 || pointCount > 1000000) {
+        // FIX-R16: 使用 protocol.js 中的统一限制常量，与 C++ kMaxPathVerbs/kMaxPathPoints 对齐。
+        // 原实现 pointCount 上限为 1000000（1M），与 C++ kMaxPathPoints=100000 不一致，
+        // 导致客户端接受比服务端发送上限更大的路径，扩大攻击面。
+        if (verbCount > PROTOCOL.LIMITS.MAX_PATH_VERBS || pointCount > PROTOCOL.LIMITS.MAX_PATH_POINTS) {
             auditLog(LOG_LEVELS.WARN, 'readPath_oversized', { verbCount, pointCount });
             return new canvasKit.Path();
         }

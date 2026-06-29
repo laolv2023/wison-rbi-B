@@ -730,6 +730,13 @@ void CommandBuffer::writeImage(const SkImage* image) {
     // inline 模式（含 hash-ref 首次遇到和 DJB2 回退路径）
     writeU8(0x00);                      // flag: 内联
     uint32_t slot = reserveImageSlot(image);  // 分配槽位 (O(1), 不编码)
+    // FIX-R16: reserveImageSlot 超限时返回 kInvalidImageSlotId 哨兵值。
+    // 客户端检测到不存在的 slot_id 后 graceful skip（drawImage_slot_miss）。
+    if (slot == kInvalidImageSlotId) {
+        fprintf(stderr, "[CommandBuffer] writeImage: image_slots_ full (%u/%u), "
+                "image dropped (client will skip)\n",
+                static_cast<uint32_t>(image_slots_.size()), kMaxImageSlotsPerFrame);
+    }
     writeU32(slot);                     // 槽位 ID (命令流中引用)
 }
 
