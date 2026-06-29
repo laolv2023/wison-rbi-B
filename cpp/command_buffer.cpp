@@ -41,23 +41,10 @@
 // Skia 实际头文件路径 (Chromium 源码树):
 //   挂载路径: third_party/skia/include/
 //   序列化所需的完整类型定义（非前向声明）
-#include "include/core/SkRect.h"
-#include "include/core/SkRRect.h"
-#include "include/core/SkPoint.h"
-#include "include/core/SkM44.h"
-#include "include/core/SkPath.h"
-#include "include/core/SkTextBlob.h"
-#include "include/core/SkVertices.h"
-#include "include/core/SkPaint.h"
-#include "include/core/SkPathEffect.h"
-#include "include/core/SkShader.h"
-#include "include/core/SkImage.h"
-#include "include/core/SkData.h"
-#include "include/core/SkPixmap.h"
-#include "include/core/SkSamplingOptions.h"
-#include "include/core/SkDrawShadowRec.h"
-#include "include/core/SkColorPriv.h"       // SkColorGetA, SkColorGetR, etc.
+#include "garnet_standalone.h"  // Skia 头文件（条件编译）
+#ifndef GARNET_STANDALONE
 #include "include/encode/SkEncodedImageFormat.h"
+#endif
 
 // SHA-256: 优先使用 Chromium 内置 BoringSSL，回退到 OpenSSL 或 DJB2
 #if defined(USE_BORINGSSL) || defined(USE_OPENSSL)
