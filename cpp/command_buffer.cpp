@@ -654,8 +654,13 @@ void CommandBuffer::writeTextBlob(const SkTextBlob* blob) {
     }
 
     // Bounds check: totalGlyphs ≤ kMaxTextBlobGlyphs
+    // FIX-R17: 超限时写入 runCount=0 而非提前返回。
+    // 原实现 return 后，drawTextBlob 的 safeCommand lambda 继续写入 paint，
+    // 但客户端期望 x + y + runCount + [runs] + paint 结构，
+    // 缺少 runCount 会导致客户端将 paint 数据误读为 runCount，造成协议反序列化错位。
     if (totalGlyphs > kMaxTextBlobGlyphs) {
-        return;  // Degrade: skip oversized text blob
+        writeU32(0);  // runCount=0: 客户端检测到后 graceful skip
+        return;
     }
 
     writeU32(runCount);
@@ -768,8 +773,17 @@ void CommandBuffer::writeVertices(const SkVertices* v) {
     int iCount = v->indexCount();
 
     // Bounds check: vertexCount ≤ kMaxVerticesCount
+    // FIX-R17: 超限时写入空 vertices 结构而非提前返回。
+    // 原实现 return 后，drawVertices 的 safeCommand lambda 继续写入 mode，
+    // 但客户端期望 vertexMode + vertexCount + indexCount + hasTexCoords + hasColors + [data] + mode 结构，
+    // 缺少前5个字段会导致客户端将 mode 误读为 vertexMode，造成协议反序列化错位。
     if (static_cast<uint32_t>(vCount) > kMaxVerticesCount) {
-        return;  // Degrade: skip oversized vertices
+        writeU8(0);  // vertexMode = Triangles (placeholder)
+        writeU32(0); // vertexCount = 0
+        writeU32(0); // indexCount = 0
+        writeU8(0);  // hasTexCoords = false
+        writeU8(0);  // hasColors = false
+        return;
     }
 
     // vertexMode(u8): 0=Triangles, 1=TriangleStrip, 2=TriangleFan
