@@ -976,9 +976,13 @@ import {
                         pts[i * 2 + 1] = payload.getFloat32(9 + i * 8, true);
                     }
                     const paint = readPaint(payload, 5 + count * 8);
-                    if (paint) {
-                        skCanvas.drawPoints(mode, pts, paint);
-                        paint.delete();
+                    // FIX-R25: 使用 try...finally 确保异常路径下 paint 不泄漏
+                    try {
+                        if (paint) {
+                            skCanvas.drawPoints(mode, pts, paint);
+                        }
+                    } finally {
+                        if (paint) paint.delete();
                     }
                 }
                 break;
@@ -1013,9 +1017,13 @@ import {
             case OP.DRAW_PAINT:
                 {
                     const paint = readPaint(payload, 0);
-                    if (paint) {
-                        skCanvas.drawPaint(paint);
-                        paint.delete();
+                    // FIX-R25: 使用 try...finally 确保异常路径下 paint 不泄漏
+                    try {
+                        if (paint) {
+                            skCanvas.drawPaint(paint);
+                        }
+                    } finally {
+                        if (paint) paint.delete();
                     }
                 }
                 break;
@@ -1092,33 +1100,47 @@ import {
                     trackPaint.setColor(CanvasKit.Color(0, 0, 0, 0.15));
                     trackPaint.setStyle(CanvasKit.PaintStyle.Fill);
                     trackPaint.setAntiAlias(true);
-                    skCanvas.drawRect(sbRect, trackPaint);
-                    trackPaint.delete();
+                    // FIX-R25: 使用 try...finally 确保异常路径下 trackPaint 不泄漏
+                    try {
+                        skCanvas.drawRect(sbRect, trackPaint);
+                    } finally {
+                        trackPaint.delete();
+                    }
                     // 绘制滑块
                     const thumbPaint = new CanvasKit.Paint();
                     thumbPaint.setColor(CanvasKit.Color(0.4, 0.4, 0.4, 0.8));
                     thumbPaint.setStyle(CanvasKit.PaintStyle.Fill);
                     thumbPaint.setAntiAlias(true);
-                    if (sbVertical) {
-                        const thumbH = sbRect[3] - sbRect[1];
-                        const thumbTop = sbRect[1] + sbPosition * thumbH;
-                        const thumbBottom = Math.min(sbRect[3], thumbTop + sbThumbSize * thumbH);
-                        const thumbRect = new CanvasKit.LTRBRect(sbRect[0], thumbTop, sbRect[2], thumbBottom);
-                        const rrect = new CanvasKit.RRect(thumbRect, 2, 2, 2, 2);
-                        skCanvas.drawRRect(rrect, thumbPaint);
-                        rrect.delete();
-                        thumbRect.delete();
-                    } else {
-                        const thumbW = sbRect[2] - sbRect[0];
-                        const thumbLeft = sbRect[0] + sbPosition * thumbW;
-                        const thumbRight = Math.min(sbRect[2], thumbLeft + sbThumbSize * thumbW);
-                        const thumbRect = new CanvasKit.LTRBRect(thumbLeft, sbRect[1], thumbRight, sbRect[3]);
-                        const rrect = new CanvasKit.RRect(thumbRect, 2, 2, 2, 2);
-                        skCanvas.drawRRect(rrect, thumbPaint);
-                        rrect.delete();
-                        thumbRect.delete();
+                    // FIX-R25: 使用 try...finally 确保异常路径下 thumbPaint/rrect/thumbRect 不泄漏
+                    try {
+                        if (sbVertical) {
+                            const thumbH = sbRect[3] - sbRect[1];
+                            const thumbTop = sbRect[1] + sbPosition * thumbH;
+                            const thumbBottom = Math.min(sbRect[3], thumbTop + sbThumbSize * thumbH);
+                            const thumbRect = new CanvasKit.LTRBRect(sbRect[0], thumbTop, sbRect[2], thumbBottom);
+                            const rrect = new CanvasKit.RRect(thumbRect, 2, 2, 2, 2);
+                            try {
+                                skCanvas.drawRRect(rrect, thumbPaint);
+                            } finally {
+                                rrect.delete();
+                                thumbRect.delete();
+                            }
+                        } else {
+                            const thumbW = sbRect[2] - sbRect[0];
+                            const thumbLeft = sbRect[0] + sbPosition * thumbW;
+                            const thumbRight = Math.min(sbRect[2], thumbLeft + sbThumbSize * thumbW);
+                            const thumbRect = new CanvasKit.LTRBRect(thumbLeft, sbRect[1], thumbRight, sbRect[3]);
+                            const rrect = new CanvasKit.RRect(thumbRect, 2, 2, 2, 2);
+                            try {
+                                skCanvas.drawRRect(rrect, thumbPaint);
+                            } finally {
+                                rrect.delete();
+                                thumbRect.delete();
+                            }
+                        }
+                    } finally {
+                        thumbPaint.delete();
                     }
-                    thumbPaint.delete();
                 }
                 break;
             case OP.NOOP:
