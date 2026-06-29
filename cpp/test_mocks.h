@@ -455,6 +455,12 @@ public:
         return n;
     }
 
+    // Conic weights (for conic bezier curves)
+    void getConicWeights(SkScalar* dst, int max) const {
+        int n = std::min(max, (int)conicWeights_.size());
+        for (int i = 0; i < n; ++i) dst[i] = conicWeights_[i];
+    }
+
     // For testing
     void moveTo(SkScalar x, SkScalar y) {
         verbs_.push_back(kMove_Verb);
@@ -471,6 +477,7 @@ public:
 private:
     std::vector<uint8_t> verbs_;
     std::vector<SkPoint> points_;
+    std::vector<SkScalar> conicWeights_;
 };
 
 // ============================================================================
