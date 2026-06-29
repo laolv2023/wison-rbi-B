@@ -450,6 +450,9 @@ void CommandBuffer::writeString(const std::string& str) {
 ///
 /// @param alignment 对齐粒度（默认 4，与 §6.2 协议一致）
 void CommandBuffer::padToAlignment(size_t alignment) {
+    // FIX-R32: 防御 alignment=0 导致的除零异常 (UB)。
+    // 当前所有调用方使用默认值 4，但防御性编程要求处理边界。
+    if (alignment == 0) return;
     size_t remainder = buffer_.size() % alignment;
     if (remainder != 0) {
         size_t pad = alignment - remainder;

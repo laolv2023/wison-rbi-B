@@ -427,10 +427,15 @@ class WisonRBIServer {
         // ── 连接关闭 ──
         // 使用 _connectionClosed 标志防止 close+error 双重清理
         let _connectionClosed = false;
+        // FIX-R32: 先声明 backpressureInterval = null，消除 TDZ (Temporal Dead Zone) 风险。
+        // 原实现中 cleanupConnection (line 430) 引用了 const backpressureInterval (line 460)，
+        // 若 close/error 事件在 line 444~460 之间同步触发（极端边界），会抛出
+        // ReferenceError: Cannot access 'backpressureInterval' before initialization。
+        let backpressureInterval = null;
         const cleanupConnection = () => {
             if (_connectionClosed) return;
             _connectionClosed = true;
-            clearInterval(backpressureInterval);
+            if (backpressureInterval !== null) clearInterval(backpressureInterval);
             try { session.close(); } catch (e) { /* 忽略 */ }
             if (this._sessions.has(sessionId)) {
                 this._sessions.delete(sessionId);
@@ -457,7 +462,7 @@ class WisonRBIServer {
         // 每 5 秒检查一次发送缓冲区
         // 若缓冲区超过高水位 (WS_HIGH_WATER_MARK = 1MB)，
         //   触发背压告警指标并在日志中记录
-        const backpressureInterval = setInterval(() => {
+        backpressureInterval = setInterval(() => {
             if (session.closed) return;
             if (ws.bufferedAmount > WS_HIGH_WATER_MARK) {
                 metrics.counter(WS_BACKPRESSURE);
