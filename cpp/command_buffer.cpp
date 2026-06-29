@@ -987,6 +987,17 @@ void CommandBuffer::appendImageCommands() {
     std::vector<uint8_t> imageCommands;
     for (const auto& slot : image_slots_) {
         if (slot.encoded && !slot.data.empty()) {
+            // FIX-R37: 在 static_cast<uint32_t> 之前检查 size_t 值。
+            // 若 slot.data.size() > UINT32_MAX (理论可能: 编码 bug 导致无限增长)，
+            // static_cast<uint32_t> 会截断为小值，使后续 payloadLen > kMaxPayloadBytes 检查失效。
+            // 提前检查原始 size_t 值，确保截断不会绕过边界检查。
+            if (slot.data.size() > kMaxPayloadBytes - 8) {
+                fprintf(stderr, "[CommandBuffer] appendImageCommands: slot %u data too large "
+                        "(dataSize=%zu, limit=%u), skipping\n",
+                        slot.id, slot.data.size(), kMaxPayloadBytes - 8);
+                continue;
+            }
+
             // payload: slot_id(4B) + data_size(4B) + data(N)
             uint32_t payloadLen = 4 + 4 + static_cast<uint32_t>(slot.data.size());
 
