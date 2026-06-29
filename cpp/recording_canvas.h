@@ -394,10 +394,8 @@ private:
             writeFunc();
             buffer_.endCommand();
         } catch (...) {
-            // On exception during write, reset command state
-            // TODO: CommandBuffer should expose abortCommand() for proper cleanup
-            // Currently endCommand() handles in_command_ reset
-            buffer_.endCommand();
+            // 异常路径: 中止命令（回退缓冲区），防止客户端解析到截断的 payload
+            buffer_.abortCommand();
             throw;
         }
     }

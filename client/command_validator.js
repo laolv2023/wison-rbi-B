@@ -329,16 +329,19 @@ class CommandValidator {
                 if (verbCount > this.LIMITS.MAX_PATH_VERBS) {
                     return this._subReject(`drawPath: verbCount ${verbCount} > ${this.LIMITS.MAX_PATH_VERBS}`);
                 }
-                if (pointCount > this.LIMITS.MAX_PATH_VERBS) {
-                    return this._subReject(`drawPath: pointCount ${pointCount} > ${this.LIMITS.MAX_PATH_VERBS}`);
+                // FIX-R15: pointCount 应检查 MAX_PATH_POINTS，而非 MAX_PATH_VERBS
+                if (pointCount > this.LIMITS.MAX_PATH_POINTS) {
+                    return this._subReject(`drawPath: pointCount ${pointCount} > ${this.LIMITS.MAX_PATH_POINTS}`);
                 }
-                // verbs: 1 byte each; points: 2×f32 each = 8 bytes
-                // conicWeights: 1×f32 per kConic verb (最多 verbCount 个)
+                // FIX-R15: 移除错误的 worstCaseSize 检查。
+                // 原公式使用 verbCount*3*8 估算 points 大小，但实际 pointCount 已从 payload 读取，
+                // 应直接使用 pointCount*8。worstCaseSize 可能小于 minSize（当 pointCount > verbCount*3 时），
+                // 导致检查冗余；也可能大于 minSize（当 pointCount < verbCount*3 时），导致误拒合法帧。
+                // 正确的最小尺寸: 8(header) + verbCount(verbs) + pointCount×8(points)
+                // conic weights 为变长（最多 verbCount×4B），包含在 payLen 剩余空间中，无需单独校验。
                 const minSize = 8 + verbCount + pointCount * 8;
-                // 保守上界: 最坏情况每 verb 消耗 3 个 point (cubicTo) + 每 verb 可能是 conic (4B weight)
-                const worstCaseSize = 8 + verbCount + verbCount * 3 * 8 + verbCount * 4;
-                if (minSize > payLen || worstCaseSize > payLen) {
-                    return this._subReject(`drawPath: sub-structure overflow (need ≤${Math.max(minSize, worstCaseSize)}, have ${payLen})`);
+                if (minSize > payLen) {
+                    return this._subReject(`drawPath: sub-structure overflow (need ≥${minSize}, have ${payLen})`);
                 }
                 break;
             }
@@ -555,19 +558,18 @@ class CommandValidator {
             case OP.DRAW_RRECT:
             case OP.DRAW_OVAL:
             case OP.DRAW_ARC:
-            case OP.DRAW_PAINT:
-            case OP.DRAW_SHADOW: {
+            case OP.DRAW_PAINT: {
                 // Paint 在 payload 中的偏移因命令而异:
                 //   DRAW_RECT:  rect(16B) + paint → paint@16
                 //   DRAW_RRECT: rrect(12×f32 + 1B type = 49B) + paint → paint@49
                 //   DRAW_OVAL:  rect(16B) + paint → paint@16
                 //   DRAW_ARC:   rect(16B) + startAngle(4B) + sweepAngle(4B) + useCenter(1B) = 25B
                 //   DRAW_PAINT: paint@0 (整个 payload 就是 Paint)
-                //   DRAW_SHADOW: paint@0 (整个 payload 就是 Paint)
                 // DRAW_POINTS 的 Shader 校验已内联至其 case 块；DRAW_PATH 因变长结构跳过 Shader 校验
+                // FIX-R15: DRAW_SHADOW 移至独立 case — 其 payload 为 path+shadowRec，不含 Paint
 
                 let paintOffset = -1;  // -1 表示不校验 (如变长路径)
-                if (opcode === OP.DRAW_PAINT || opcode === OP.DRAW_SHADOW) {
+                if (opcode === OP.DRAW_PAINT) {
                     paintOffset = 0;        // 无几何体，Paint 在 payload 起始
                 } else if (opcode === OP.DRAW_RECT || opcode === OP.DRAW_OVAL) {
                     paintOffset = 16;       // 16B rect (x,y,w,h 各 f32)
@@ -582,6 +584,32 @@ class CommandValidator {
                         payload, paintOffset, payLen
                     );
                     if (!shaderResult.valid) return shaderResult;
+                }
+                break;
+            }
+
+            // ── DRAW_SHADOW: path + shadowRec (无 Paint) ──
+            // FIX-R15: 原实现错误地将 DRAW_SHADOW 归入 Paint 验证组，
+            // 导致在 offset 0 处尝试解析 Paint Shader，实际该位置是 path 的 verbCount。
+            // 正确结构: writePath(path) + writeShadowRec(rec)
+            //   path: verbCount(4B) + pointCount(4B) + verbs(verbCount×1B) + conicWeights(变长) + points(pointCount×8B)
+            //   shadowRec: 9×f32 + 1×u32 = 40B
+            case OP.DRAW_SHADOW: {
+                if (payLen < 8 + 40) {
+                    return this._subReject(`drawShadow: payload too short (need ≥48, have ${payLen})`);
+                }
+                const verbCount = payload.getUint32(0, true);
+                const pointCount = payload.getUint32(4, true);
+                if (verbCount > this.LIMITS.MAX_PATH_VERBS) {
+                    return this._subReject(`drawShadow: verbCount ${verbCount} > ${this.LIMITS.MAX_PATH_VERBS}`);
+                }
+                if (pointCount > this.LIMITS.MAX_PATH_POINTS) {
+                    return this._subReject(`drawShadow: pointCount ${pointCount} > ${this.LIMITS.MAX_PATH_POINTS}`);
+                }
+                // 最小尺寸: 8(header) + verbCount(verbs) + pointCount×8(points) + 40(shadowRec)
+                const minSize = 8 + verbCount + pointCount * 8 + 40;
+                if (minSize > payLen) {
+                    return this._subReject(`drawShadow: sub-structure overflow (need ≥${minSize}, have ${payLen})`);
                 }
                 break;
             }

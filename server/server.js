@@ -688,7 +688,7 @@ class WisonRBIServer {
                 metrics.counter(FRAMES_DROPPED);
                 metrics.counter(WS_ERRORS);
                 console.error(
-                    `[server] Critical backpressure: closing session ${session.id} ` +
+                    `[server] Critical backpressure: closing session ${session.sessionId} ` +
                     `(${ws.bufferedAmount} bytes buffered, limit ${WS_HIGH_WATER_MARK * 5})`
                 );
                 ws.close(1011, 'Backpressure overload');

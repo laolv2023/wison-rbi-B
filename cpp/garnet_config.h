@@ -175,6 +175,13 @@ constexpr uint32_t kMaxImageSetCount = 10000;
 /// 典型网页单帧图像数 < 100，10,000 足够覆盖复杂场景。
 constexpr uint32_t kMaxImageSlotsPerFrame = 10000;
 
+/// @brief 无效图像槽位 ID（哨兵值）。
+///
+/// 当 image_slots_.size() >= kMaxImageSlotsPerFrame 时，reserveImageSlot()
+/// 返回此值。调用方将此值写入命令流，客户端检测到后跳过该图像绘制
+/// （graceful degradation），而非尝试查找不存在的槽位数据。
+constexpr uint32_t kInvalidImageSlotId = 0xFFFFFFFF;
+
 // ═══════════════════════════════════════════════════════════════
 // 图像/字体缓存上限 — §4.1.4 配置项 1 (hash-ref 模式)
 // ═══════════════════════════════════════════════════════════════

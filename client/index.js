@@ -882,6 +882,60 @@ import {
                 // Phase 3+: 完整实现需 readRect + readPaint + drawArc
                 auditLog(LOG_LEVELS.ERROR, 'unimplemented_opcode', { opcode: 'DRAW_ARC', opcodeHex: '0x34' });
                 break;
+
+            // ── FIX-R15: DRAW_SHADOW (0x62) — path + shadowRec (40B)，无 Paint ──
+            // 原实现完全缺失此 case，DRAW_SHADOW 命令落入 default 分支被静默丢弃。
+            // 虽然不影响协议同步（dispatcher 按 pay_len 跳过），但阴影渲染功能丢失。
+            case OP.DRAW_SHADOW:
+                {
+                    if (payLen < 48) {
+                        auditLog(LOG_LEVELS.WARN, 'drawShadow_payload_too_short', { payLen });
+                        break;
+                    }
+                    const shadowPath = readPath(payload, 0);
+                    // 计算 path 数据总长度（与 DRAW_PATH 相同的逻辑）
+                    const sVerbCount = payload.getUint32(0, true);
+                    const sPointCount = payload.getUint32(4, true);
+                    let sConicCount = 0;
+                    if (sVerbCount > 0 && 8 + sVerbCount <= payload.byteLength) {
+                        for (let i = 0; i < sVerbCount; i++) {
+                            if (payload.getUint8(8 + i) === 3) sConicCount++;
+                        }
+                    }
+                    const shadowRecOffset = 8 + sVerbCount + sPointCount * 8 + sConicCount * 4;
+                    if (shadowRecOffset + 40 > payLen) {
+                        auditLog(LOG_LEVELS.WARN, 'drawShadow_shadowRec_oob', { shadowRecOffset, payLen });
+                        shadowPath.delete();
+                        break;
+                    }
+                    // shadowRec: 9×f32 + 1×u32 = 40B
+                    const zPlaneX = payload.getFloat32(shadowRecOffset, true);
+                    const zPlaneY = payload.getFloat32(shadowRecOffset + 4, true);
+                    const zPlaneZ = payload.getFloat32(shadowRecOffset + 8, true);
+                    const lightX = payload.getFloat32(shadowRecOffset + 12, true);
+                    const lightY = payload.getFloat32(shadowRecOffset + 16, true);
+                    const lightZ = payload.getFloat32(shadowRecOffset + 20, true);
+                    const lightRadius = payload.getFloat32(shadowRecOffset + 24, true);
+                    const ambientAlpha = payload.getFloat32(shadowRecOffset + 28, true);
+                    const spotAlpha = payload.getFloat32(shadowRecOffset + 32, true);
+                    const shadowFlags = payload.getUint32(shadowRecOffset + 36, true);
+
+                    // CanvasKit.drawShadow 是独立函数（非 SkCanvas 方法）
+                    if (typeof CanvasKit.drawShadow === 'function') {
+                        const zPlaneParams = [zPlaneX, zPlaneY, zPlaneZ];
+                        const lightPos = [lightX, lightY, lightZ];
+                        // C++ 仅序列化 alpha 通道，RGB 丢失，使用黑色 (0x00) + alpha 重建
+                        const ambientColor = CanvasKit.Color(0, 0, 0, ambientAlpha);
+                        const spotColor = CanvasKit.Color(0, 0, 0, spotAlpha);
+                        CanvasKit.drawShadow(
+                            skCanvas, shadowPath, zPlaneParams, lightPos,
+                            lightRadius, ambientColor, spotColor, shadowFlags
+                        );
+                    }
+                    shadowPath.delete();
+                }
+                break;
+
             case OP.DRAW_POINTS:
                 {
                     if (payLen < 5) { auditLog(LOG_LEVELS.WARN, 'drawPoints_payload_too_short', { payLen }); break; }
@@ -1683,13 +1737,15 @@ import {
             return;
         }
 
-        // Process each run, accumulate glyphs/positions for the last run's paint
-        let lastBuilder = null;
+        // FIX-R15: 收集所有 run 的 TextBlob，而非仅保留最后一个。
+        // 原实现在循环中 lastBuilder.delete() 丢弃了前面的 run，
+        // 导致多 run 文本仅渲染最后一行。
+        const builders = [];
         for (let r = 0; r < runCount; r++) {
             // Bounds check: fontId(4) + glyphCount(4) = 8B
             if (off + 8 > payLen) {
                 auditLog(LOG_LEVELS.WARN, 'drawTextBlob_run_header_bounds', { off, r, payLen });
-                if (lastBuilder) lastBuilder.delete();
+                for (const b of builders) b.delete();
                 return;
             }
             const fontId = payload.getUint32(off, true);
@@ -1702,7 +1758,7 @@ import {
             const positionsEnd = glyphsEnd + glyphCount * 8;
             if (positionsEnd > payLen) {
                 auditLog(LOG_LEVELS.WARN, 'drawTextBlob_run_data_bounds', { glyphCount, positionsEnd, payLen });
-                if (lastBuilder) lastBuilder.delete();
+                for (const b of builders) b.delete();
                 return;
             }
 
@@ -1716,24 +1772,26 @@ import {
             if (typeface && glyphCount > 0) {
                 const builder = canvasKit.TextBlob.MakeFromGlyphs(glyphs, positions, typeface);
                 if (builder) {
-                    if (lastBuilder) lastBuilder.delete();
-                    lastBuilder = builder;
+                    builders.push(builder);
                 }
             }
         }
 
         // Read paint after all runs (C++ writes paint once after writeTextBlob)
-        if (lastBuilder) {
+        // FIX-R15: 使用同一个 paint 绘制所有 run 的 TextBlob
+        if (builders.length > 0) {
             const paint = readPaint(payload, off);
-            if (paint) {
-                skCanvas.drawTextBlob(lastBuilder, x, y, paint);
-                paint.delete();
-            } else {
-                const defaultPaint = new canvasKit.Paint();
-                skCanvas.drawTextBlob(lastBuilder, x, y, defaultPaint);
-                defaultPaint.delete();
+            const drawPaint = paint || (() => {
+                const dp = new canvasKit.Paint();
+                return dp;
+            })();
+            for (const builder of builders) {
+                skCanvas.drawTextBlob(builder, x, y, drawPaint);
             }
-            lastBuilder.delete();
+            drawPaint.delete();
+            for (const builder of builders) {
+                builder.delete();
+            }
         }
     }
 

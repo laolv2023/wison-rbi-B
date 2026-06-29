@@ -120,6 +120,11 @@ int RecordingCanvas::save() {
 }
 
 void RecordingCanvas::restore() {
+    // FIX-R15: 防止 save_depth_ 下溢。若 save_depth_==0 则无匹配的 kSave，
+    // 发出 kRestore 会导致客户端画布状态栈不平衡。
+    if (save_depth_ <= 0) {
+        return;
+    }
     safeCommand(Opcode::kRestore, [&]() {
         save_depth_--;
     });
@@ -739,6 +744,16 @@ void RecordingCanvas::drawColor(SkColor4f color, SkBlendMode mode) {
 
 void RecordingCanvas::drawShadow(const SkPath& path,
                                   const SkDrawShadowRec& rec) {
+    // FIX-R15: 路径边界检查 — writePath 对超大路径静默跳过，但 drawShadow 的
+    // payload 结构为 path + shadowRec，若 path 被跳过则客户端反序列化错位。
+    // 必须在 safeCommand 之前检查，超大路径直接跳过整条命令。
+    if (static_cast<uint32_t>(path.countVerbs()) > kMaxPathVerbs ||
+        static_cast<uint32_t>(path.countPoints()) > kMaxPathPoints) {
+        fprintf(stderr, "[RecordingCanvas] drawShadow: verbCount=%d or pointCount=%d "
+                "exceeds limits (verbs=%u, points=%u), skipping\n",
+                path.countVerbs(), path.countPoints(), kMaxPathVerbs, kMaxPathPoints);
+        return;
+    }
     safeCommand(Opcode::kDrawShadow, [&]() {
         buffer_.writePath(path);
         buffer_.writeShadowRec(rec);
@@ -813,7 +828,13 @@ void RecordingCanvas::drawAnnotation(const SkRect& rect, const char key[],
 
 void RecordingCanvas::recordSolidColorLayer(const SkColor4f& color,
                                              const SkRect& bounds) {
-    // 通过 drawColor + clipRect 的模式序列化纯色图层
+    // FIX-R15: 用 save/restore 包裹 clipRect，防止 clip 状态泄漏到后续命令。
+    // 原实现仅 clipRect + drawColor，clipRect 会永久修改当前裁剪区域，
+    // 导致后续绘制命令被意外裁剪。
+    safeCommand(Opcode::kSave, [&]() {
+        save_depth_++;
+    });
+
     // 先 clipRect 再 drawColor，确保颜色仅影响图层边界内
     safeCommand(Opcode::kClipRect, [&]() {
         buffer_.writeRect(bounds);
@@ -824,6 +845,10 @@ void RecordingCanvas::recordSolidColorLayer(const SkColor4f& color,
     safeCommand(Opcode::kDrawColor, [&]() {
         buffer_.writeColor4f(color);
         buffer_.writeU8(static_cast<uint8_t>(SkBlendMode::kSrcOver));
+    });
+
+    safeCommand(Opcode::kRestore, [&]() {
+        save_depth_--;
     });
 }
 

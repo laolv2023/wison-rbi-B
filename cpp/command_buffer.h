@@ -201,6 +201,15 @@ public:
     /// @see beginCommand()
     void endCommand();
 
+    /// @brief 中止当前命令：回退缓冲区到 current_command_start_，丢弃所有已写入的 payload。
+    ///
+    /// 安全关键: 用于异常路径下回滚部分写入的命令，防止客户端解析到
+    /// 截断的 payload 导致协议反序列化错位。
+    ///
+    /// @throws std::logic_error 如果当前没有进行中的命令 (in_command_==false)
+    /// @see beginCommand(), endCommand()
+    void abortCommand();
+
     /// @brief 便捷方法：一次性写入完整命令（opcode + payload）。
     ///
     /// 等价于 beginCommand(opcode) + writeBlob(payload, pay_len) + endCommand()。

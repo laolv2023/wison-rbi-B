@@ -277,6 +277,16 @@ void CommandBuffer::endCommand() {
     in_command_ = false;
 }
 
+void CommandBuffer::abortCommand() {
+    if (!in_command_) {
+        throw std::logic_error("abortCommand called without beginCommand");
+    }
+
+    // 原子回退: 移除整条命令（含 4B 命令头），恢复到 beginCommand 之前的状态
+    buffer_.resize(current_command_start_);
+    in_command_ = false;
+}
+
 /// @brief 便捷方法：一次性写入完整命令。
 ///
 /// 等价于: beginCommand(opcode) + writeBlob(payload, pay_len) + endCommand()
@@ -884,11 +894,13 @@ void CommandBuffer::writeM44(const SkM44& m) {
 /// @returns 槽位 ID（在命令流中通过 writeU32 写入）
 uint32_t CommandBuffer::reserveImageSlot(const SkImage* image) {
     // 防御: 单帧图像槽位数量限制，防止 OOM
+    // 注意: 不执行 FIFO 淘汰。已写入命令流的 slot_id 引用不可撤销，
+    //       淘汰旧槽位会导致客户端 DRAW_IMAGE 引用不存在的 IMAGE_DATA，
+    //       造成协议反序列化错位。超限时返回哨兵值，由客户端 graceful skip。
     if (image_slots_.size() >= kMaxImageSlotsPerFrame) {
-        // 淘汰最旧的槽位（FIFO），但 slot_id 不复用（使用单调递增计数器）
-        image_slots_.erase(image_slots_.begin());
+        return kInvalidImageSlotId;
     }
-    // 使用单调递增计数器分配 slot_id，避免 FIFO 淘汰后 slot_id 碰撞
+    // 使用单调递增计数器分配 slot_id，避免 slot_id 碰撞
     uint32_t slot_id = next_slot_id_++;
     ImageSlot slot;
     slot.id = slot_id;

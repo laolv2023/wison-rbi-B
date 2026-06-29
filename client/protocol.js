@@ -203,6 +203,8 @@ const PROTOCOL = Object.freeze({
         MAX_COMMANDS_PER_FRAME:   100000,
         /** drawPath 最大 verb 数 (100k)。防止路径炸弹导致 OOM。 */
         MAX_PATH_VERBS:           100000,
+        /** drawPath 最大 point 数 (100k)。防止路径炸弹导致 OOM。FIX-R15: 新增。 */
+        MAX_PATH_POINTS:          100000,
         /** drawTextBlob 最大字形数 (50k)。防止字形炸弹。 */
         MAX_TEXT_BLOB_GLYPHS:     50000,
         /** drawVertices 最大顶点数 (100k)。防止顶点炸弹。 */
