@@ -1,0 +1,76 @@
+# BUILD.gn — Wison-RBI Garnet 模块构建定义
+#
+# 在 Chromium 源码树中的挂载路径: //garnet/
+# 使用方法:
+#   1. 将 cpp/ 目录下所有文件复制到 Chromium 源码树的 //garnet/ 目录
+#   2. 在 //BUILD.gn 的 deps 中添加 "//garnet:garnet"
+#   3. 运行: ninja -C out/Release garnet
+#
+# 依赖:
+#   - //skia（Skia 图形库，Chromium 内置）
+#   - //base（Chromium 基础库，可选）
+#
+
+# ── garnet 模块（静态库）──
+# 编译时不定义 GARNET_STANDALONE，使用真实 Skia 头文件
+static_library("garnet") {
+  sources = [
+    "command_buffer.cpp",
+    "layer_recorder.cpp",
+    "recording_canvas.cpp",
+  ]
+
+  # 条件编译: 不定义 GARNET_STANDALONE → 使用真实 Skia
+  # garnet_standalone.h 检测到未定义 GARNET_STANDALONE 后自动 include 真实 Skia 头文件
+  defines = [ "GARNET_INTEGRATED" ]
+
+  # 头文件（声明依赖关系，不单独编译）
+  public_headers = [
+    "garnet_config.h",
+    "garnet_standalone.h",
+    "frame_constants.h",
+    "command_buffer.h",
+    "layer_recorder.h",
+    "recording_canvas.h",
+  ]
+
+  # 依赖 Skia（Chromium 源码树中的 //skia）
+  deps = [
+    "//skia",
+  ]
+
+  # include 路径
+  include_dirs = [
+    ".",
+  ]
+
+  # 编译标志
+  cflags_cc = [
+    "-std=c++20",
+    "-Wno-unused-parameter",
+    "-Wno-unused-variable",
+  ]
+}
+
+# ── garnet 独立测试（不依赖 Chromium，使用 Mock Skia）──
+# 仅在独立编译时使用，不在 Chromium 源码树中编译
+if (false) {
+  executable("garnet_tests_standalone") {
+    sources = [
+      "command_buffer.cpp",
+      "layer_recorder.cpp",
+      "recording_canvas.cpp",
+      "test_runner.cpp",
+    ]
+
+    # 独立编译: 定义 GARNET_STANDALONE → 使用 test_mocks.h
+    defines = [ "GARNET_STANDALONE" ]
+
+    include_dirs = [ "." ]
+
+    cflags_cc = [
+      "-std=c++20",
+      "-Wno-unused-parameter",
+    ]
+  }
+}
