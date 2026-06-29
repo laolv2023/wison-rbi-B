@@ -809,8 +809,12 @@ import {
                     const path = readPath(payload, 0);
                     const op = payload.getUint8(payLen - 2);
                     const doAA = payload.getUint8(payLen - 1);
-                    skCanvas.clipPath(path, op, !!doAA);
-                    path.delete();
+                    // FIX-R24: 使用 try...finally 确保异常路径下 path 不泄漏
+                    try {
+                        skCanvas.clipPath(path, op, !!doAA);
+                    } finally {
+                        path.delete();
+                    }
                 }
                 break;
 
@@ -820,9 +824,13 @@ import {
                     if (payLen < 16) { auditLog(LOG_LEVELS.WARN, 'drawRect_payload_too_short', { payLen }); break; }
                     const rect = readRect(payload, 0);
                     const paint = readPaint(payload, 16);
-                    if (paint) {
-                        skCanvas.drawRect(rect, paint);
-                        paint.delete();
+                    // FIX-R24: 使用 try...finally 确保异常路径下 paint 不泄漏
+                    try {
+                        if (paint) {
+                            skCanvas.drawRect(rect, paint);
+                        }
+                    } finally {
+                        if (paint) paint.delete();
                     }
                 }
                 break;
@@ -831,9 +839,13 @@ import {
                     if (payLen < 49) { auditLog(LOG_LEVELS.WARN, 'drawRRect_payload_too_short', { payLen }); break; }
                     const rrect = readRRect(payload, 0);
                     const paint = readPaint(payload, 49);
-                    if (paint) {
-                        skCanvas.drawRRect(rrect, paint);
-                        paint.delete();
+                    // FIX-R24: 使用 try...finally 确保异常路径下 paint 不泄漏
+                    try {
+                        if (paint) {
+                            skCanvas.drawRRect(rrect, paint);
+                        }
+                    } finally {
+                        if (paint) paint.delete();
                     }
                 }
                 break;
@@ -842,9 +854,13 @@ import {
                     if (payLen < 16) { auditLog(LOG_LEVELS.WARN, 'drawOval_payload_too_short', { payLen }); break; }
                     const rect = readRect(payload, 0);
                     const paint = readPaint(payload, 16);
-                    if (paint) {
-                        skCanvas.drawOval(rect, paint);
-                        paint.delete();
+                    // FIX-R24: 使用 try...finally 确保异常路径下 paint 不泄漏
+                    try {
+                        if (paint) {
+                            skCanvas.drawOval(rect, paint);
+                        }
+                    } finally {
+                        if (paint) paint.delete();
                     }
                 }
                 break;
@@ -864,11 +880,15 @@ import {
                     // Paint 位于 path 数据之后: verbs + points + conicWeights
                     const paintOffset = 8 + verbCount + pointCount * 8 + conicCount * 4;
                     const paint = readPaint(payload, paintOffset);
-                    if (paint) {
-                        skCanvas.drawPath(path, paint);
-                        paint.delete();
+                    // FIX-R24: 使用 try...finally 确保异常路径下 path 和 paint 不泄漏
+                    try {
+                        if (paint) {
+                            skCanvas.drawPath(path, paint);
+                        }
+                    } finally {
+                        if (paint) paint.delete();
+                        path.delete();
                     }
-                    path.delete();
                 }
                 break;
 
@@ -921,18 +941,22 @@ import {
                     const shadowFlags = payload.getUint32(shadowRecOffset + 36, true);
 
                     // CanvasKit.drawShadow 是独立函数（非 SkCanvas 方法）
-                    if (typeof CanvasKit.drawShadow === 'function') {
-                        const zPlaneParams = [zPlaneX, zPlaneY, zPlaneZ];
-                        const lightPos = [lightX, lightY, lightZ];
-                        // C++ 仅序列化 alpha 通道，RGB 丢失，使用黑色 (0x00) + alpha 重建
-                        const ambientColor = CanvasKit.Color(0, 0, 0, ambientAlpha);
-                        const spotColor = CanvasKit.Color(0, 0, 0, spotAlpha);
-                        CanvasKit.drawShadow(
-                            skCanvas, shadowPath, zPlaneParams, lightPos,
-                            lightRadius, ambientColor, spotColor, shadowFlags
-                        );
+                    // FIX-R24: 使用 try...finally 确保异常路径下 shadowPath 不泄漏
+                    try {
+                        if (typeof CanvasKit.drawShadow === 'function') {
+                            const zPlaneParams = [zPlaneX, zPlaneY, zPlaneZ];
+                            const lightPos = [lightX, lightY, lightZ];
+                            // C++ 仅序列化 alpha 通道，RGB 丢失，使用黑色 (0x00) + alpha 重建
+                            const ambientColor = CanvasKit.Color(0, 0, 0, ambientAlpha);
+                            const spotColor = CanvasKit.Color(0, 0, 0, spotAlpha);
+                            CanvasKit.drawShadow(
+                                skCanvas, shadowPath, zPlaneParams, lightPos,
+                                lightRadius, ambientColor, spotColor, shadowFlags
+                            );
+                        }
+                    } finally {
+                        shadowPath.delete();
                     }
-                    shadowPath.delete();
                 }
                 break;
 
@@ -1641,14 +1665,17 @@ import {
         }
 
         if (img) {
-            if (paint) {
-                skCanvas.drawImage(img, left, top, paint);
-                paint.delete();
-                paint = null;  // 标记已释放
-            } else {
-                skCanvas.drawImage(img, left, top);
+            // FIX-R24: 使用 try...finally 确保异常路径下 img 和 paint 不泄漏
+            try {
+                if (paint) {
+                    skCanvas.drawImage(img, left, top, paint);
+                } else {
+                    skCanvas.drawImage(img, left, top);
+                }
+            } finally {
+                if (paint) paint.delete();
+                img.delete();
             }
-            img.delete();
         } else if (paint) {
             // FIX: img 为 null 时 paint 未释放 — WASM 内存泄漏
             paint.delete();
@@ -1757,7 +1784,8 @@ import {
                     defaultPaint.delete();
                 }
             } finally {
-                // FIX: 确保 src/dst/img 在异常路径下也被释放
+                // FIX: 确保 src/dst/img/paint 在异常路径下也被释放
+                if (paint) paint.delete();
                 src.delete();
                 dst.delete();
                 img.delete();
@@ -1832,18 +1860,19 @@ import {
 
         // Read paint after all runs (C++ writes paint once after writeTextBlob)
         // FIX-R15: 使用同一个 paint 绘制所有 run 的 TextBlob
+        // FIX-R24: 使用 try...finally 确保异常路径下资源不泄漏
         if (builders.length > 0) {
             const paint = readPaint(payload, off);
-            const drawPaint = paint || (() => {
-                const dp = new canvasKit.Paint();
-                return dp;
-            })();
-            for (const builder of builders) {
-                skCanvas.drawTextBlob(builder, x, y, drawPaint);
-            }
-            drawPaint.delete();
-            for (const builder of builders) {
-                builder.delete();
+            const drawPaint = paint || new canvasKit.Paint();
+            try {
+                for (const builder of builders) {
+                    skCanvas.drawTextBlob(builder, x, y, drawPaint);
+                }
+            } finally {
+                drawPaint.delete();
+                for (const builder of builders) {
+                    builder.delete();
+                }
             }
         }
     }
@@ -1901,14 +1930,18 @@ import {
         }
 
         // FIX-R22: 读取 C++ 写入的 paint，用于绘制所有 run
+        // FIX-R24: 使用 try...finally 确保异常路径下资源不泄漏
         const paint = readPaint(payload, off);
         const drawPaint = paint || new canvasKit.Paint();
-        for (const builder of builders) {
-            skCanvas.drawTextBlob(builder, 0, 0, drawPaint);
-        }
-        drawPaint.delete();
-        for (const builder of builders) {
-            builder.delete();
+        try {
+            for (const builder of builders) {
+                skCanvas.drawTextBlob(builder, 0, 0, drawPaint);
+            }
+        } finally {
+            drawPaint.delete();
+            for (const builder of builders) {
+                builder.delete();
+            }
         }
     }
 
@@ -2229,18 +2262,20 @@ import {
      */
     function showDisconnectedOverlay(message) {
         if (!skCanvas || !canvasKit) return;
+        const paint = new canvasKit.Paint();
+        const font = new canvasKit.Font(null, 16);
         try {
             skCanvas.clear(canvasKit.TRANSPARENT);
-            const paint = new canvasKit.Paint();
             paint.setColor([1, 0, 0, 1]);
             paint.setAntiAlias(true);
-            const font = new canvasKit.Font(null, 16);
             skCanvas.drawText(message, 60, 60, paint, font);
             skCanvas.flush();
-            font.delete();
-            paint.delete();
         } catch (e) {
             // 忽略渲染错误 — CanvasKit 可能处于不一致状态
+        } finally {
+            // FIX-R24: 使用 finally 确保资源总是被释放，防止异常路径下内存泄漏
+            font.delete();
+            paint.delete();
         }
     }
 
