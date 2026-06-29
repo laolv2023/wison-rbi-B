@@ -298,9 +298,10 @@ const PROTOCOL = Object.freeze({
     /**
      * Shader 渐变的最大颜色停止点数。
      * 防止攻击者发送超大数据结构的颜色表导致 OOM。
-     * 32 个停止点覆盖所有合理的渐变用途 (CSS 规范也无此限制，但实际无限会 OOM)。
+     * FIX-R34: 从 32 修正为 16，与 C++ garnet_config.h kMaxGradientStops=16 对齐。
+     * C++ writePaint 使用栈上 SkColor[16] 数组，超过 16 会被截断。
      */
-    MAX_GRADIENT_COLORS: 32,
+    MAX_GRADIENT_COLORS: 16,
 });
 
 export { PROTOCOL };

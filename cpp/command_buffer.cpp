@@ -477,7 +477,7 @@ void CommandBuffer::padToAlignment(size_t alignment) {
 ///   Fixed fields: color(u32=4B) + strokeWidth(f32) + style(u8) + strokeCap(u8) +
 ///                 strokeJoin(u8) + pad(u8) + strokeMiter(f32) + blendMode(u8) + antiAlias(u8) = 18B
 ///   FIX-R20: 修正注释 — color 使用 writeU32 (4B)，非 writeColor4f (16B)。
-///   Shader: only linear gradient (≤2 stops). Non-gradient → skip.
+///   Shader: only linear gradient (≤ kMaxGradientStops=16 stops). Non-gradient → skip.
 ///   Effects: only Dash path effect. MaskFilter/ColorFilter/ImageFilter → always 0.
 ///   Blender: always 0 (kSrcOver default).
 ///
@@ -534,15 +534,15 @@ void CommandBuffer::writePaint(const SkPaint& paint) {
     {
         sk_sp<SkShader> shader = paint.refShader();
         if (shader) {
-            SkColor      colors[16];
-            SkScalar     offsets[16];
+            SkColor      colors[kMaxGradientStops];
+            SkScalar     offsets[kMaxGradientStops];
             SkShader::GradientInfo gradInfo;
             gradInfo.fColors        = colors;
             gradInfo.fColorOffsets  = offsets;
-            gradInfo.fColorCount    = 16;
+            gradInfo.fColorCount    = kMaxGradientStops;
             int actualStops = shader->asAGradient(&gradInfo);
 
-            if (actualStops > 0 && actualStops <= 16) {
+            if (actualStops > 0 && actualStops <= static_cast<int>(kMaxGradientStops)) {
                 writeU8(1);  // hasShader = true
                 writeU8(0);  // shaderType = LINEAR (客户端 SHADER_HEADER_SIZE[0])
 

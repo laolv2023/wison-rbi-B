@@ -143,6 +143,12 @@ constexpr uint32_t kMaxPathPoints = 300000;
 /// 50,000 glyphs ≈ 500KB 数据，覆盖极限场景（整页 CJK 字符）。
 constexpr uint32_t kMaxTextBlobGlyphs = 50000;
 
+/// @brief 渐变 shader 最大颜色停止点数: 16。
+///
+/// 安全理由: Skia asAGradient 使用栈上数组 SkColor[16]，超过 16 会被截断。
+/// FIX-R34: 原为硬编码 16，现提取为命名常量，与 client protocol.js MAX_GRADIENT_COLORS 对齐。
+constexpr uint32_t kMaxGradientStops = 16;
+
 /// @brief drawGlyphRunList 最大 run 数量: 256。
 ///
 /// 安全理由: 防止伪造 glyphRunList.size() 导致过多 run 迭代。
