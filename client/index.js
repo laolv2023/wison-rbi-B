@@ -1826,16 +1826,14 @@ import {
         if (img) {
             const src = new CanvasKit.LTRBRect(srcRect[0], srcRect[1], srcRect[2], srcRect[3]);
             const dst = new CanvasKit.LTRBRect(dstRect[0], dstRect[1], dstRect[2], dstRect[3]);
+            // FIX-R28: 统一 paint 管理 — 如果没有 paint，创建默认 paint，
+            // 确保所有 paint 对象都在 finally 块中被释放。
+            // 原实现在 else 分支创建 defaultPaint，异常时 finally 无法访问导致泄漏。
+            if (!paint) {
+                paint = new CanvasKit.Paint();
+            }
             try {
-                if (paint) {
-                    skCanvas.drawImageRect(img, src, dst, paint);
-                    paint.delete();
-                    paint = null;  // 标记已释放，避免 finally 重复删除
-                } else {
-                    const defaultPaint = new CanvasKit.Paint();
-                    skCanvas.drawImageRect(img, src, dst, defaultPaint);
-                    defaultPaint.delete();
-                }
+                skCanvas.drawImageRect(img, src, dst, paint);
             } finally {
                 // FIX: 确保 src/dst/img/paint 在异常路径下也被释放
                 if (paint) paint.delete();
