@@ -59,7 +59,7 @@ const CRC32_TABLE = (() => {
  * 但 WebSocket 层已有 TLS 1.3 提供完整性保护。CRC32 主要检测:
  *   1. 网络传输 bit 翻转
  *   2. 服务端 gzip 实现 bug 导致的数据损坏
- *   3. socket.io 消息分片/重组的边界错误
+ *   3. WebSocket 消息分片/重组的边界错误
  *
  * @param {Uint8Array|ArrayBuffer} data - 待校验数据
  * @param {number} [seed=0] - 初始 CRC 值 (用于分段计算)
