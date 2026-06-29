@@ -48,12 +48,7 @@
 
 #include "layer_recorder.h"
 
-#include "include/core/SkColor.h"        // SkColor4f
-#include "include/core/SkMatrix.h"       // SkMatrix
-#include "include/core/SkPaint.h"        // SkPaint
-#include "include/core/SkRect.h"         // SkRect
-#include "include/core/SkBlendMode.h"    // SkBlendMode
-#include "include/core/SkCanvas.h"       // SkCanvas::clipRect (SkClipOp)
+#include "garnet_standalone.h"  // Skia 头文件（条件编译）
 
 #include <cstring>                       // memcpy
 #include <mutex>                         // lock_guard
