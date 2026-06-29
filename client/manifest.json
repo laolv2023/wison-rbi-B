@@ -52,7 +52,7 @@
   "_comment__web_accessible_resources": "Web 可访问资源：白名单控制哪些扩展文件可被重定向后的页面引用",
   "_comment__war_details": "  - index.html/index.js 等为应用核心模块",
   "_comment__war_details2": "  - canvaskit-wasm: Skia WASM 渲染引擎",
-  "_comment__war_details3": "  - socket.io-client: WebSocket 通信客户端",
+  "_comment__war_details3": "  - 原生 WebSocket API: 浏览器内置 WebSocket 通信",
   "_comment__war_details4": "  - matches: <all_urls> 允许从所有 URL 访问这些资源",
   "web_accessible_resources": [
     {
@@ -64,10 +64,11 @@
         "utils.js",
         "font_registry.js",
         "image_cache.js",
-        "node_modules/canvaskit-wasm/bin/*",
-        "node_modules/socket.io-client/dist/*"
+        "node_modules/canvaskit-wasm/bin/*"
       ],
-      "matches": ["<all_urls>"]
+      "matches": [
+        "<all_urls>"
+      ]
     }
   ],
   "_comment__dnr": "声明式网络请求规则：定义 HTTP 请求拦截逻辑",
