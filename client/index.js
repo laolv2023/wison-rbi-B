@@ -1380,19 +1380,64 @@ import {
     }
 
     function readRect(payload, offset) {
-        return canvasKit.XYWHRect(
-            payload.getFloat32(offset, true),
-            payload.getFloat32(offset + 4, true),
-            payload.getFloat32(offset + 8, true),
-            payload.getFloat32(offset + 12, true)
+        // FIX-R19: 使用 LTRBRect 而非 XYWHRect。
+        // C++ writeRect 写入 left, top, right, bottom (LTRB 格式)，
+        // 原实现使用 XYWHRect(x, y, width, height) 解析，导致:
+        //   - left 被误读为 x（正确）
+        //   - top 被误读为 y（正确）
+        //   - right 被误读为 width（错误！应为 right - left）
+        //   - bottom 被误读为 height（错误！应为 bottom - top）
+        // 对于 left=0, top=0 的矩形，两种格式结果相同，测试无法发现此 bug。
+        // 对于 left≠0 或 top≠0 的矩形，渲染尺寸错误。
+        return canvasKit.LTRBRect(
+            payload.getFloat32(offset, true),       // left
+            payload.getFloat32(offset + 4, true),   // top
+            payload.getFloat32(offset + 8, true),   // right
+            payload.getFloat32(offset + 12, true)   // bottom
         );
     }
 
     function readRRect(payload, offset) {
+        // FIX-R19: 与 C++ writeRRect 格式对齐。
+        // C++ 格式: type(u8) + rect(16B) + 4 radii(4×8B=32B) = 49 bytes
+        // 原实现仅读取 rect(16B) + rx(4B) + ry(4B) = 24B，导致:
+        //   1. RRect 数据读取偏移错误（type 字段被误读为 rect 的一部分）
+        //   2. 后续 Paint 偏移错误（少读 25 字节）
+        //   3. 复杂 RRect（4 角不同半径）渲染不正确
+        if (offset + 49 > payload.byteLength) {
+            auditLog(LOG_LEVELS.WARN, 'readRRect_bounds', { offset, byteLength: payload.byteLength });
+            return canvasKit.RRectXY(canvasKit.LTRBRect(0, 0, 0, 0), 0, 0);
+        }
+        // type (u8) — SkRRect::Type: 0=Empty,1=Rect,2=Oval,3=Simple,4=NinePatch,5=Complex
+        // 目前不直接使用 type，通过 radii 数据隐式确定
+        const rrectType = payload.getUint8(offset);
+        offset += 1;
+        // rect (4 × f32 = 16B)
         const rect = readRect(payload, offset);
-        const rx = payload.getFloat32(offset + 16, true);
-        const ry = payload.getFloat32(offset + 20, true);
-        return canvasKit.RRectXY(rect, rx, ry);
+        offset += 16;
+        // 4 corner radii (4 × 2 × f32 = 32B)
+        // 顺序: UpperLeft, UpperRight, LowerRight, LowerLeft
+        const ulRx = payload.getFloat32(offset, true);
+        const ulRy = payload.getFloat32(offset + 4, true);
+        const urRx = payload.getFloat32(offset + 8, true);
+        const urRy = payload.getFloat32(offset + 12, true);
+        const lrRx = payload.getFloat32(offset + 16, true);
+        const lrRy = payload.getFloat32(offset + 20, true);
+        const llRx = payload.getFloat32(offset + 24, true);
+        const llRy = payload.getFloat32(offset + 28, true);
+
+        // CanvasKit.RRectXY 仅支持 4 角相同半径。
+        // 对于 Simple 类型（4 角相同），直接使用第一个角的 rx, ry。
+        // 对于 Complex 类型（4 角不同），取 4 角 rx, ry 的平均值作为近似。
+        // 这保证 Paint 偏移正确（49 字节），即使复杂 RRect 渲染有轻微偏差。
+        if (rrectType === 3) { // Simple: 4 角相同
+            return canvasKit.RRectXY(rect, ulRx, ulRy);
+        } else {
+            // 取平均值作为近似
+            const avgRx = (ulRx + urRx + lrRx + llRx) / 4;
+            const avgRy = (ulRy + urRy + lrRy + llRy) / 4;
+            return canvasKit.RRectXY(rect, avgRx, avgRy);
+        }
     }
 
     function readPath(payload, offset) {
