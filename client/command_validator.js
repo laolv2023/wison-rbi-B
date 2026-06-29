@@ -416,8 +416,9 @@ class CommandValidator {
                 break;
             }
 
-            // ── drawGlyphRunList (0x51): runCount(4)+[fontId(4)+glyphCount(4)+glyphs(N×2)+positions(N×8)]*runCount ──
-            // 注意: 此 opcode 不含 x/y 和 paint
+            // ── drawGlyphRunList (0x51): runCount(4)+[fontId(4)+glyphCount(4)+glyphs(N×2)+positions(N×8)]*runCount + paint(N) ──
+            // FIX-R22: C++ 在所有 run 之后写入 paint，原注释错误称"不含paint"。
+            // 验证: 检查 run 数据后至少有 18B (paint 固定头) 空间。
             case OP.DRAW_GLYPH_RUN_LIST: {
                 if (payLen < 4) return this._subReject('drawGlyphRunList: payload too short');
                 const grlRunCount = payload.getUint32(0, true);
@@ -438,6 +439,10 @@ class CommandValidator {
                     }
                     grlOff += 8 + grlGlyphCount * 2 + grlGlyphCount * 8;
                     if (grlOff > payLen) return this._subReject(`drawGlyphRunList: run ${r} data overflow (need ${grlOff}, have ${payLen})`);
+                }
+                // FIX-R22: 检查 paint 至少有 18B (固定头) 空间
+                if (grlOff + 18 > payLen) {
+                    return this._subReject(`drawGlyphRunList: paint overflow (need ${grlOff + 18}, have ${payLen})`);
                 }
                 break;
             }

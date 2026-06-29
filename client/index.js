@@ -1850,8 +1850,9 @@ import {
 
     function drawGlyphRunList(payload, payLen) {
         // Protocol format (matches C++ drawGlyphRunList, opcode kDrawGlyphRunList=0x51):
-        //   runCount(u32) + [fontId(u32) + glyphCount(u32) + glyphs(u16*N) + positions(f32*2*N)]*runCount
-        // 注意: 此 opcode 不含 x/y 坐标和 paint，使用默认 paint 在 (0,0) 绘制
+        //   runCount(u32) + [fontId(u32) + glyphCount(u32) + glyphs(u16*N) + positions(f32*2*N)]*runCount + paint(N)
+        // FIX-R22: C++ 在所有 run 之后写入 paint，客户端原实现未读取 paint 而使用默认 paint。
+        // 修复为读取 paint 并用于绘制。
         if (payLen < 4) {
             auditLog(LOG_LEVELS.WARN, 'drawGlyphRunList_too_short', { payLen });
             return;
@@ -1865,11 +1866,13 @@ import {
         }
         if (runCount === 0) return;
 
-        const defaultPaint = new canvasKit.Paint();
+        // FIX-R22: 先收集所有 run 的 TextBlob，读完 paint 后统一绘制
+        const builders = [];
         for (let r = 0; r < runCount; r++) {
             if (off + 8 > payLen) {
                 auditLog(LOG_LEVELS.WARN, 'drawGlyphRunList_run_header_bounds', { off, r, payLen });
-                break;
+                for (const b of builders) b.delete();
+                return;
             }
             const fontId = payload.getUint32(off, true);
             off += 4;
@@ -1880,7 +1883,8 @@ import {
             const positionsEnd = glyphsEnd + glyphCount * 8;
             if (positionsEnd > payLen) {
                 auditLog(LOG_LEVELS.WARN, 'drawGlyphRunList_run_data_bounds', { glyphCount, positionsEnd, payLen });
-                break;
+                for (const b of builders) b.delete();
+                return;
             }
 
             const glyphs = new Uint16Array(payload.buffer, payload.byteOffset + off, glyphCount);
@@ -1891,12 +1895,21 @@ import {
             if (typeface && glyphCount > 0) {
                 const builder = canvasKit.TextBlob.MakeFromGlyphs(glyphs, positions, typeface);
                 if (builder) {
-                    skCanvas.drawTextBlob(builder, 0, 0, defaultPaint);
-                    builder.delete();
+                    builders.push(builder);
                 }
             }
         }
-        defaultPaint.delete();
+
+        // FIX-R22: 读取 C++ 写入的 paint，用于绘制所有 run
+        const paint = readPaint(payload, off);
+        const drawPaint = paint || new canvasKit.Paint();
+        for (const builder of builders) {
+            skCanvas.drawTextBlob(builder, 0, 0, drawPaint);
+        }
+        drawPaint.delete();
+        for (const builder of builders) {
+            builder.delete();
+        }
     }
 
     function handleFontData(payload, payLen) {
