@@ -728,20 +728,32 @@ import {
                         paint = readPaint(payload, off);
                     }
                     if (paint) {
+                        // FIX-R26: 使用 try...finally 确保异常路径下 paint 和 r 不泄漏
                         if (bounds) {
                             const r = new CanvasKit.LTRBRect(bounds[0], bounds[1], bounds[2], bounds[3]);
-                            skCanvas.saveLayer(paint, r);
-                            r.delete();
+                            try {
+                                skCanvas.saveLayer(paint, r);
+                            } finally {
+                                r.delete();
+                                paint.delete();
+                            }
                         } else {
-                            skCanvas.saveLayer(paint);
+                            try {
+                                skCanvas.saveLayer(paint);
+                            } finally {
+                                paint.delete();
+                            }
                         }
-                        paint.delete();
                     } else {
                         // FIX: 修复 LTRBRect WASM 内存泄漏 — 原代码创建 LTRBRect 后未 delete
+                        // FIX-R26: 使用 try...finally 确保异常路径下 r 不泄漏
                         if (bounds) {
                             const r = new CanvasKit.LTRBRect(bounds[0], bounds[1], bounds[2], bounds[3]);
-                            skCanvas.saveLayer(null, r);
-                            r.delete();
+                            try {
+                                skCanvas.saveLayer(null, r);
+                            } finally {
+                                r.delete();
+                            }
                         } else {
                             skCanvas.saveLayer(null, null);
                         }
@@ -1237,6 +1249,19 @@ import {
         }
 
         const paint = new canvasKit.Paint();
+        // FIX-R26: 使用 try...catch 确保异常路径下 paint 不泄漏。
+        // 如果 readShader 或 paint.setShader 抛出异常，paint 对象会被泄漏。
+        // 修复: 捕获异常，删除 paint，返回 null。调用方已处理 null paint。
+        try {
+            return _readPaintImpl(payload, offset, paint);
+        } catch (e) {
+            paint.delete();
+            auditLog(LOG_LEVELS.WARN, 'readPaint_exception', { error: e.message });
+            return null;
+        }
+    }
+
+    function _readPaintImpl(payload, offset, paint) {
 
         // ── Color: uint32 RGBA 解包为 [r,g,b,a] 0-1 浮点数组 ──
         const rgba = payload.getUint32(offset, true);
