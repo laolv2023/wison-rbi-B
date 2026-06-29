@@ -67,8 +67,8 @@ import {
     // ═══════════════════════════════════════════════════════════
 
     const CONFIG = Object.freeze({
-        /** WebSocket 服务器地址 (默认 ws://，启用 TLS 时使用 wss://) */
-        SERVER_URL: 'ws://localhost:3000',
+        /** WebSocket 服务器地址。可通过 URL 参数 ?server=ws://host:port 覆盖，默认 ws://，启用 TLS 时使用 wss:// */
+        SERVER_URL: new URL(location).searchParams.get('server') || 'ws://localhost:3000',
         /** DOM 中 Canvas 元素的 id 属性值 */
         CANVAS_ID: 'main',
         /** 重连初始延迟 (ms) — 指数退避的基准值 */
@@ -236,8 +236,8 @@ import {
     //   客户端 → 服务端: JSON 文本消息 {type: "ready", url: "..."} / {type: "viewport", ...}
     //   服务端 → 客户端: 二进制帧 (ArrayBuffer) 或 JSON 文本消息 {type: "error", ...}
     //
-    // 安全: WebSocket 连接可选用 TLS 1.3 (wss://) 加密；本文不涉及 TLS 配置。
-    //   默认 ws:// 适用于受信内网部署；wss:// 由部署方在 CONFIG.SERVER_URL 中按需配置。
+    // 安全: WebSocket 连接可选用 TLS 1.3 (wss://) 加密。
+    //   SERVER_URL 默认 ws://localhost:3000，可通过 URL 参数 ?server= 覆盖。
     // ═══════════════════════════════════════════════════════════
 
     /** 重连定时器句柄 */
