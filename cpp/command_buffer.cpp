@@ -611,11 +611,10 @@ void CommandBuffer::writePath(const SkPath& path) {
     }
 
     // Write conic weights (one f32 per kConic verb)
-    // Skia stores conic weights separately from points; client readPath expects
-    // weights interleaved into the points array at conicTo positions.
-    // To match the client's readPath which reads weight as points[ptIdx+4],
-    // we must write weights as additional f32 values after the points array,
-    // one per kConic verb, in order.
+    // FIX-R18: 修正注释 — 客户端 readPath 从单独的 weights 区域读取，
+    // 而非从 points 数组中交错读取。C++ 和客户端格式一致:
+    //   verbs[u8*verbCount] + points[f32*2*pointCount] + conicWeights[f32*conicCount]
+    // conicCount = verbCount 中 kConic_Verb 的数量，weights 紧跟在 points 之后。
     {
         // Count conic verbs
         int conicCount = 0;
