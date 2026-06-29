@@ -997,15 +997,20 @@ import {
                 break;
             case OP.DRAW_COLOR:
                 {
-                    if (payLen < 5) {
+                    // FIX-R20: 与 C++ writeColor4f 格式对齐。
+                    // C++ drawColor 写入: color4f(4×f32=16B) + blendMode(u8=1B) = 17B
+                    // 原实现读取 4×u8(4B) + mode(1B) = 5B，导致:
+                    //   1. 颜色值错误（读取 f32 的 IEEE754 字节作为 RGBA 通道值）
+                    //   2. blendMode 读取位置错误（读取 fG 的第一个字节作为 mode）
+                    if (payLen < 17) {
                         auditLog(LOG_LEVELS.WARN, 'drawColor_payload_too_short', { payLen });
                         break;
                     }
-                    const r = payload.getUint8(0);
-                    const g = payload.getUint8(1);
-                    const b = payload.getUint8(2);
-                    const a = payload.getUint8(3);
-                    const mode = payload.getUint8(4);
+                    const r = payload.getFloat32(0, true);
+                    const g = payload.getFloat32(4, true);
+                    const b = payload.getFloat32(8, true);
+                    const a = payload.getFloat32(12, true);
+                    const mode = payload.getUint8(16);
                     skCanvas.drawColor([r, g, b, a], mode || canvasKit.BlendMode.SrcOver);
                 }
                 break;

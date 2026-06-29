@@ -551,6 +551,16 @@ class CommandValidator {
                 break;
             }
 
+            // ── DRAW_COLOR: color4f(16B) + blendMode(1B) = 17B，无 Paint ──
+            // FIX-R20: 新增 DRAW_COLOR 验证。C++ drawColor 使用 writeColor4f (4×f32=16B)，
+            // 非 writeU32 (4B)。原验证器缺少此 case，DRAW_COLOR 命令未经验证。
+            case OP.DRAW_COLOR: {
+                if (payLen < 17) {
+                    return this._subReject(`drawColor: payload too short (need ≥17, have ${payLen})`);
+                }
+                break;
+            }
+
             // ── 含 Paint 的绘制命令: 校验 Paint 内的 Shader 子结构 (Phase 2) ──
             // 威胁: Shader 中的 colorCount 字段可能伪造 → OOM
             // 防御: 递归调用 _validatePaintShader 检查 Shader 子结构的完整性

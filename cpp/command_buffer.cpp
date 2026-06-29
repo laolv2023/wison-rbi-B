@@ -471,8 +471,9 @@ void CommandBuffer::padToAlignment(size_t alignment) {
 /// @brief 序列化 SkPaint (v4 MVP: 基础属性 + 线性渐变 Shader + Dash PathEffect)
 ///
 /// v4 SCOPE (BASIC ONLY, ~220 lines):
-///   Fixed fields: color4f(16B) + blendMode(u8) + style(u8) + strokeWidth(f32) +
-///                 strokeMiter(f32) + strokeCap(u8) + strokeJoin(u8) + antiAlias(u8)
+///   Fixed fields: color(u32=4B) + strokeWidth(f32) + style(u8) + strokeCap(u8) +
+///                 strokeJoin(u8) + pad(u8) + strokeMiter(f32) + blendMode(u8) + antiAlias(u8) = 18B
+///   FIX-R20: 修正注释 — color 使用 writeU32 (4B)，非 writeColor4f (16B)。
 ///   Shader: only linear gradient (≤2 stops). Non-gradient → skip.
 ///   Effects: only Dash path effect. MaskFilter/ColorFilter/ImageFilter → always 0.
 ///   Blender: always 0 (kSrcOver default).
