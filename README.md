@@ -114,9 +114,7 @@ npm test
 node --test tests/
 ```
 
-> **注意**: 客户端使用 `socket.io-client` 库，服务端使用 `ws` 库。两者协议不兼容。
-> 当前架构中客户端通过 socket.io 的 `frame` 事件接收二进制帧，服务端需适配 socket.io 协议层。
-> 生产部署前需统一 WebSocket 库（建议服务端改用 `socket.io` 或客户端改用原生 `WebSocket`）。
+> 客户端使用浏览器原生 WebSocket API（无外部依赖），服务端使用 `ws` 库。两端协议兼容。
 
 ---
 
