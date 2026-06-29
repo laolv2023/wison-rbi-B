@@ -1,0 +1,108 @@
+# Dockerfile.chromium-builder — Wison-RBI Garnet 模块编译环境
+#
+# 基于 Ubuntu 22.04 LTS，预装 Chromium 编译所需的所有依赖。
+# 使用多阶段构建减小最终镜像体积。
+#
+# 用法:
+#   docker build -t wison-rbi-builder -f docker/Dockerfile.chromium-builder .
+#   docker run -it --rm \
+#     -v /opt/chromium:/opt/chromium \
+#     -v $(pwd):/repo \
+#     --cpus=16 --memory=32g \
+#     wison-rbi-builder
+#
+# 环境要求（宿主机）:
+#   - 磁盘: >= 120GB（映射到 /opt/chromium）
+#   - 内存: >= 16GB（推荐 32GB）
+#   - CPU: >= 8 核（推荐 16 核）
+#
+
+FROM ubuntu:22.04
+
+LABEL maintainer="Wison-RBI Team"
+LABEL description="Chromium M143 build environment for Wison-RBI Garnet module"
+
+# 避免交互式安装
+ENV DEBIAN_FRONTEND=noninteractive
+ENV DEPOT_TOOLS_DIR=/opt/depot_tools
+ENV CHROMIUM_SRC=/opt/chromium/src
+ENV PATH="/opt/depot_tools:${PATH}"
+
+# ═══════════════════════════════════════════════════════════
+# 安装系统依赖
+# ═══════════════════════════════════════════════════════════
+
+RUN apt-get update -qq && apt-get install -y --no-install-recommends \
+    # 基础工具
+    build-essential \
+    clang \
+    lld \
+    lld-15 \
+    llvm \
+    ninja-build \
+    pkg-config \
+    # 版本控制
+    git \
+    curl \
+    wget \
+    # Python（Chromium 构建系统依赖）
+    python3 \
+    python3-pip \
+    python3-setuptools \
+    # Chromium 编译依赖
+    libnss3-dev \
+    libatk1.0-dev \
+    libatk-bridge2.0-dev \
+    libcups2-dev \
+    libxkbcommon-dev \
+    libxcomposite-dev \
+    libxdamage1 \
+    libxrandr2 \
+    libgbm-dev \
+    libpango1.0-dev \
+    libcairo2-dev \
+    libasound2-dev \
+    libxshmfence-dev \
+    libffi-dev \
+    libglib2.0-dev \
+    libdbus-1-dev \
+    libdrm-dev \
+    libwayland-dev \
+    # 其他工具
+    sudo \
+    ca-certificates \
+    tzdata \
+    && rm -rf /var/lib/apt/lists/*
+
+# 设置时区
+RUN ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
+
+# ═══════════════════════════════════════════════════════════
+# 安装 depot_tools
+# ═══════════════════════════════════════════════════════════
+
+RUN git clone --depth=1 https://chromium.googlesource.com/chromium/tools/depot_tools.git "$DEPOT_TOOLS_DIR"
+
+# ═══════════════════════════════════════════════════════════
+# 创建非 root 用户
+# ═══════════════════════════════════════════════════════════
+
+RUN useradd -m -s /bin/bash builder && \
+    echo "builder ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
+
+# 创建 Chromium 源码目录
+RUN mkdir -p /opt/chromium && chown -R builder:builder /opt/chromium
+
+USER builder
+WORKDIR /home/builder
+
+# ═══════════════════════════════════════════════════════════
+# 入口点
+# ═══════════════════════════════════════════════════════════
+
+COPY scripts/build_chromium.sh /usr/local/bin/build_chromium.sh
+RUN sudo chmod +x /usr/local/bin/build_chromium.sh
+
+# 默认入口: 运行一键编译脚本
+ENTRYPOINT ["/usr/local/bin/build_chromium.sh"]
+CMD []
