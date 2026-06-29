@@ -2,9 +2,6 @@
 
 ## 基于 Chromium Compositor 层拦截的浏览器隔离系统
 
-> **代码版本**: v1.6 (基于设计方案 v1.6 第二轮安全审计修复版)
-> **状态**: 生产级实现
-
 Wison-RBI 是一个浏览器隔离（Browser Isolation）系统，通过在 Chromium Compositor 层拦截绘制命令，使客户端浏览器不必执行任何远程 HTML/CSS/JavaScript，仅接收经过安全校验的 Skia 绘制命令。
 
 ### 与 Cloudflare NVR 的关键区别
