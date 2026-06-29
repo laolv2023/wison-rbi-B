@@ -1097,10 +1097,27 @@ static CommandBuffer::ImageHash ComputeImageSHA256(const SkImage* image) {
     // ── BoringSSL / OpenSSL path ──────────────────────────────────
     SkPixmap pixmap;
     if (image->peekPixels(&pixmap)) {
-        // 光栅图像: 直接哈希像素数据
-        SHA256(static_cast<const uint8_t*>(pixmap.addr()),
-               pixmap.computeByteSize(),
-               hash.bytes);
+        // FIX-R33: 防御性空指针检查 — peekPixels 返回 true 时 addr() 理论上非空，
+        // 但 lazy-backed / GPU-backed 图像在极端边界 (如 GPU 上下文丢失) 可能返回 null。
+        // SHA256(data=null, len>0) 是未定义行为 (可能 SIGSEGV)。
+        const uint8_t* pixelData = static_cast<const uint8_t*>(pixmap.addr());
+        size_t pixelLen = pixmap.computeByteSize();
+        if (pixelData != nullptr && pixelLen > 0) {
+            SHA256(pixelData, pixelLen, hash.bytes);
+        } else if (pixelData != nullptr && pixelLen == 0) {
+            // 零字节图像: SHA256 of empty data (合法操作)
+            SHA256(pixelData, 0, hash.bytes);
+        } else {
+            // addr() 为 null: 降级为 PNG 编码路径
+            sk_sp<SkData> encoded = image->encodeToData(SkEncodedImageFormat::kPNG, 100);
+            if (encoded && encoded->size() > 0) {
+                SHA256(static_cast<const uint8_t*>(encoded->data()),
+                       encoded->size(),
+                       hash.bytes);
+            } else {
+                std::memset(hash.bytes, 0, 32);
+            }
+        }
     } else {
         // 非光栅图像 (GPU-backed / lazy): 通过 PNG 编码获取字节
         sk_sp<SkData> encoded = image->encodeToData(SkEncodedImageFormat::kPNG, 100);
@@ -1120,12 +1137,15 @@ static CommandBuffer::ImageHash ComputeImageSHA256(const SkImage* image) {
 
     SkPixmap pixmap;
     if (image->peekPixels(&pixmap)) {
+        // FIX-R33: 防御性空指针检查 — 与 BoringSSL/OpenSSL path 一致
         const uint8_t* data = static_cast<const uint8_t*>(pixmap.addr());
         size_t len = pixmap.computeByteSize();
-        // 对像素数据取样哈希（每 64 字节取 1 字节，避免大图像开销过大）
-        size_t step = std::max<size_t>(1, len / 4096);
-        for (size_t i = 0; i < len; i += step) {
-            djb2 = ((djb2 << 5) + djb2) + data[i];  // djb2 * 33 + byte
+        if (data != nullptr && len > 0) {
+            // 对像素数据取样哈希（每 64 字节取 1 字节，避免大图像开销过大）
+            size_t step = std::max<size_t>(1, len / 4096);
+            for (size_t i = 0; i < len; i += step) {
+                djb2 = ((djb2 << 5) + djb2) + data[i];  // djb2 * 33 + byte
+            }
         }
     } else {
         // 非光栅图像: 编码为 PNG 后取样哈希
