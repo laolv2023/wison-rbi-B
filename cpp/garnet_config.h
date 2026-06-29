@@ -164,6 +164,7 @@ constexpr uint32_t kMaxVerticesCount = 100000;
 ///
 /// 安全理由: 防止 drawAtlas payload 中伪造 count 导致 OOM。
 constexpr uint32_t kMaxAtlasCount = 100000;
+constexpr uint32_t kMaxPointsCount = 100000;
 
 /// @brief drawImageLattice 最大分区数: 10,000。
 ///
