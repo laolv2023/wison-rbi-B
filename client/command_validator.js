@@ -629,6 +629,42 @@ class CommandValidator {
                 break;
             }
 
+            // ── FIX-R30: 补充缺失的 opcode 最小 payload 验证（防御深度）──
+            // 这些 opcode 在 dispatcher 中已有 bounds check，但在 validator 中
+            // 缺少预验证。添加最小 payload 大小检查，提前拒绝畸形帧。
+            case OP.SAVE:
+            case OP.RESTORE:
+            case OP.NOOP:
+                // 无 payload，无需验证
+                break;
+            case OP.TRANSLATE:
+                if (payLen < 8) return this._subReject(`translate: payload too short (need ≥8, have ${payLen})`);
+                break;
+            case OP.SCALE:
+                if (payLen < 8) return this._subReject(`scale: payload too short (need ≥8, have ${payLen})`);
+                break;
+            case OP.ROTATE:
+                if (payLen < 4) return this._subReject(`rotate: payload too short (need ≥4, have ${payLen})`);
+                break;
+            case OP.CONCAT:
+                if (payLen < 36) return this._subReject(`concat: payload too short (need ≥36, have ${payLen})`);
+                break;
+            case OP.CONCAT44:
+                if (payLen < 64) return this._subReject(`concat44: payload too short (need ≥64, have ${payLen})`);
+                break;
+            case OP.CLIP_RECT:
+                if (payLen < 18) return this._subReject(`clipRect: payload too short (need ≥18, have ${payLen})`);
+                break;
+            case OP.CLIP_RRECT:
+                if (payLen < 51) return this._subReject(`clipRRect: payload too short (need ≥51, have ${payLen})`);
+                break;
+            case OP.CLIP_PATH:
+                if (payLen < 10) return this._subReject(`clipPath: payload too short (need ≥10, have ${payLen})`);
+                break;
+            case OP.SAVE_LAYER:
+                if (payLen < 3) return this._subReject(`saveLayer: payload too short (need ≥3, have ${payLen})`);
+                break;
+
             default:
                 // 其他 opcode 当前不需要深度子结构校验。
                 // 新 opcode 添加到 PROTOCOL.OPCODE 时需评估是否需要在此添加校验。
